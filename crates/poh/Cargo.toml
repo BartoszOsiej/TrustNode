@@ -1,0 +1,20 @@
+[package]
+name = "solana-poh"
+version = "0.1.0"
+edition = "2021"
+description = "Proof of History — SHA-256 hash chain verifiable clock"
+
+[dependencies]
+sha2 = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

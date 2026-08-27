@@ -1,0 +1,30 @@
+[package]
+name = "solana-validator"
+version = "0.1.0"
+edition = "2021"
+description = "Custom Solana-like validator — Proof of History + Tower BFT"
+
+[[bin]]
+name = "solana-validator"
+path = "src/main.rs"
+
+[dependencies]
+solana-poh = { path = "../crates/poh" }
+solana-accounts = { path = "../crates/accounts" }
+solana-tx-processor = { path = "../crates/tx-processor" }
+solana-consensus = { path = "../crates/consensus" }
+solana-turbine = { path = "../crates/turbine" }
+solana-gossip = { path = "../crates/gossip" }
+solana-rpc = { path = "../crates/rpc" }
+solana-program-executor = { path = "../crates/program-executor" }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+parking_lot = { workspace = true }
+hex = { workspace = true }
+clap = { version = "4", features = ["derive"] }

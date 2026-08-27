@@ -1,0 +1,18 @@
+[package]
+name = "solana-gossip"
+version = "0.1.0"
+edition = "2021"
+description = "Gossip protocol — CRDS node communication"
+
+[dependencies]
+solana-poh = { path = "../poh" }
+sha2 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
