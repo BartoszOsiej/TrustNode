@@ -309,7 +309,7 @@ mod tests {
         let mut logs = Vec::new();
 
         let from_key = setup_token_account(&accounts, 0, 100);
-        let to_key = setup_token_account(&accounts, 1, 0);
+        let _to_key = setup_token_account(&accounts, 1, 0);
 
         let metas = vec![
             AccountMeta::new(0, true, true),

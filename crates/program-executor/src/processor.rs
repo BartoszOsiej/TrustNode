@@ -131,7 +131,7 @@ impl InstructionProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instruction::{AccountMeta, Instruction};
+    use crate::instruction::{AccountMeta, Instruction, SystemInstruction};
 
     fn test_processor() -> InstructionProcessor {
         let accounts = Arc::new(AccountsDB::new());
