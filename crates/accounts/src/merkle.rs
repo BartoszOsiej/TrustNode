@@ -80,7 +80,11 @@ impl StateRoot {
 
                     // If this pair contains our target, save the sibling
                     if i == current_index / 2 {
-                        let sibling_idx = if current_index.is_multiple_of(2) { 1 } else { 0 };
+                        let sibling_idx = if current_index.is_multiple_of(2) {
+                            1
+                        } else {
+                            0
+                        };
                         if sibling_idx < chunk.len() {
                             // is_left = sibling is on the LEFT side (sibling hashes first)
                             let is_left = !current_index.is_multiple_of(2);
