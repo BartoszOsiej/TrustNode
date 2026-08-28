@@ -121,7 +121,7 @@ impl PohRecorder {
             return Ok(());
         }
 
-        let txs: Vec<TransactionEntry> = self.pending_transactions.drain(..).collect();
+        let txs: Vec<TransactionEntry> = std::mem::take(&mut self.pending_transactions);
         let num_txs = txs.len() as u64;
 
         // Hash forward
@@ -165,7 +165,7 @@ impl PohRecorder {
 
     /// Start a new slot
     pub fn new_slot(&mut self, slot: u64) -> Vec<PohEntry> {
-        let entries = self.current_entries.drain(..).collect();
+        let entries = std::mem::take(&mut self.current_entries);
         self.hasher.new_slot(slot);
         self.entry_index = 0;
         entries
@@ -209,7 +209,7 @@ impl PohRecorder {
             }
 
             // Log progress periodically
-            if self.tick_height % 1000 == 0 {
+            if self.tick_height.is_multiple_of(1000) {
                 tracing::info!(
                     "PoH tick_height={}, hashes={}, slot={}",
                     self.tick_height,

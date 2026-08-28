@@ -34,7 +34,7 @@ impl LeaderSchedule {
         assert!(!validators.is_empty(), "Must have at least one validator");
 
         let mut sorted = validators;
-        sorted.sort_by(|a, b| b.lamports.cmp(&a.lamports));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.lamports));
 
         let mut schedule = Self {
             validators: sorted,

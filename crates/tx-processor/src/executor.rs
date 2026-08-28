@@ -53,8 +53,10 @@ pub struct Executor {
     db: Arc<AccountsDB>,
     /// Lock table for concurrent access
     /// Maps account index -> whether it's currently locked for writing
+    #[allow(dead_code)]
     write_locks: DashMap<u8, ()>,
     /// Accounts locked for reading (count of concurrent readers)
+    #[allow(dead_code)]
     read_locks: DashMap<u8, u64>,
     /// Total transactions executed
     total_executed: RwLock<u64>,

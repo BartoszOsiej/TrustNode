@@ -59,7 +59,7 @@ impl ErasureCoder {
     /// Splits the input data into `k` data shards and computes `m` parity shards
     /// using a simplified Reed-Solomon-like encoding.
     pub fn encode(&self, data: &[u8], slot: u64) -> Vec<Shred> {
-        let shard_size = (data.len() + self.config.data_shards - 1) / self.config.data_shards;
+        let shard_size = data.len().div_ceil(self.config.data_shards);
         let mut shards = Vec::new();
 
         // Create data shards

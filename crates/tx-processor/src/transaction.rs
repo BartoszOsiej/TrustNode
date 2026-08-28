@@ -60,11 +60,11 @@ impl Transaction {
     /// Compute the transaction hash
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(&self.signer);
-        hasher.update(&self.recent_blockhash);
+        hasher.update(self.signer);
+        hasher.update(self.recent_blockhash);
 
         for ix in &self.instructions {
-            hasher.update(&ix.program_id);
+            hasher.update(ix.program_id);
             hasher.update(&ix.data);
         }
 

@@ -165,13 +165,13 @@ impl GossipMessage {
     /// Compute message hash for deduplication
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(&self.from);
+        hasher.update(self.from);
         hasher.update((self.message_type as u8).to_le_bytes());
-        hasher.update(&self.timestamp.to_le_bytes());
+        hasher.update(self.timestamp.to_le_bytes());
 
         match &self.payload {
             GossipPayload::Push(data) => {
-                hasher.update(&data.id);
+                hasher.update(data.id);
                 hasher.update(&data.content);
             }
             GossipPayload::PullRequest(data) => {

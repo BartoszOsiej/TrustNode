@@ -11,7 +11,6 @@ use crate::processor::ComputeBudget;
 use crate::InstructionError;
 use solana_accounts::account::{Account, AccountData, Pubkey};
 use solana_accounts::store::AccountsDB;
-use std::sync::Arc;
 
 /// Process a token program instruction
 pub fn process_instruction(
@@ -56,7 +55,7 @@ fn process_initialize_account(
 fn process_token_transfer(
     amount: u64,
     account_metas: &[AccountMeta],
-    signer: &Pubkey,
+    _signer: &Pubkey,
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,

@@ -44,7 +44,7 @@ impl Neighborhood {
         max_depth: usize,
     ) -> Self {
         // Sort by stake descending
-        validators.sort_by(|a, b| b.1.cmp(&a.1));
+        validators.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         let total = validators.len();
         if total == 0 {
@@ -115,7 +115,7 @@ impl Neighborhood {
 
             // Distribute remaining validators among children
             if !next_remaining.is_empty() && !children.is_empty() {
-                let per_child = (next_remaining.len() + children.len() - 1) / children.len();
+                let per_child = next_remaining.len().div_ceil(children.len());
                 for (i, &child_idx) in children.iter().enumerate() {
                     let start = i * per_child;
                     let end = std::cmp::min(start + per_child, next_remaining.len());

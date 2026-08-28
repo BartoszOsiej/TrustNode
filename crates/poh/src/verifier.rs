@@ -45,6 +45,7 @@ impl VerificationResult {
 
 /// PoH chain verifier
 pub struct PohVerifier {
+    #[allow(dead_code)]
     /// The last known valid hash
     last_valid_hash: Option<PohHash>,
     /// Total entries verified
@@ -62,6 +63,7 @@ impl PohVerifier {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_with_state(last_valid_hash: PohHash) -> Self {
         Self {
             last_valid_hash: Some(last_valid_hash),
@@ -105,7 +107,7 @@ impl PohVerifier {
             }
         }
 
-        let mut result = VerificationResult::ok(entries.len() as u64, total_hashes);
+        let result = VerificationResult::ok(entries.len() as u64, total_hashes);
         // Note: tracking entries_verified happens at a higher level
         result
     }

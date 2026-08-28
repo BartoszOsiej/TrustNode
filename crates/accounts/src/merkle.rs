@@ -32,8 +32,8 @@ impl StateRoot {
                 if chunk.len() == 2 {
                     // Hash pair
                     let mut hasher = Sha256::new();
-                    hasher.update(&chunk[0]);
-                    hasher.update(&chunk[1]);
+                    hasher.update(chunk[0]);
+                    hasher.update(chunk[1]);
                     let result = hasher.finalize();
                     let mut bytes = [0u8; 32];
                     bytes.copy_from_slice(&result);
@@ -71,8 +71,8 @@ impl StateRoot {
             for (i, chunk) in current_level.chunks(2).enumerate() {
                 if chunk.len() == 2 {
                     let mut hasher = Sha256::new();
-                    hasher.update(&chunk[0]);
-                    hasher.update(&chunk[1]);
+                    hasher.update(chunk[0]);
+                    hasher.update(chunk[1]);
                     let result = hasher.finalize();
                     let mut bytes = [0u8; 32];
                     bytes.copy_from_slice(&result);
@@ -80,10 +80,10 @@ impl StateRoot {
 
                     // If this pair contains our target, save the sibling
                     if i == current_index / 2 {
-                        let sibling_idx = if current_index % 2 == 0 { 1 } else { 0 };
+                        let sibling_idx = if current_index.is_multiple_of(2) { 1 } else { 0 };
                         if sibling_idx < chunk.len() {
                             // is_left = sibling is on the LEFT side (sibling hashes first)
-                            let is_left = current_index % 2 != 0;
+                            let is_left = !current_index.is_multiple_of(2);
                             siblings.push((chunk[sibling_idx], is_left));
                         }
                     }
@@ -140,9 +140,9 @@ impl MerkleProof {
             let mut hasher = Sha256::new();
             if *is_left {
                 hasher.update(sibling);
-                hasher.update(&current);
+                hasher.update(current);
             } else {
-                hasher.update(&current);
+                hasher.update(current);
                 hasher.update(sibling);
             }
             let result = hasher.finalize();

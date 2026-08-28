@@ -1,12 +1,10 @@
 //! Instruction processor — dispatches and executes instructions
 
-use crate::instruction::{
-    AccountMeta, Instruction, InstructionResult, SystemInstruction, TokenInstruction,
-};
+use crate::instruction::{Instruction, InstructionResult};
 use crate::programs::system_program;
 use crate::programs::token_program;
 use crate::{InstructionError, DEFAULT_COMPUTE_UNITS};
-use solana_accounts::account::{Account, AccountData, Pubkey};
+use solana_accounts::account::{Account, Pubkey};
 use solana_accounts::store::AccountsDB;
 use std::sync::Arc;
 

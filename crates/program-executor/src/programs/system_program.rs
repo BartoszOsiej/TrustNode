@@ -11,7 +11,6 @@ use crate::processor::ComputeBudget;
 use crate::InstructionError;
 use solana_accounts::account::{Account, AccountData, Pubkey};
 use solana_accounts::store::AccountsDB;
-use std::sync::Arc;
 
 /// Minimum rent-exempt balance for an account
 pub const MINIMUM_RENT_EXEMPT_BALANCE: u64 = 890_880; // ~0.00089 SOL
@@ -118,6 +117,7 @@ fn process_transfer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Process account creation
 fn process_create_account(
     lamports: u64,

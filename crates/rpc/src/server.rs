@@ -34,7 +34,7 @@ impl RpcServer {
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 match stream.read(&mut buf).await {
-                    Ok(0) => return,
+                    Ok(0) => (),
                     Ok(n) => {
                         let body = &buf[..n];
                         // Find the JSON body after HTTP headers
