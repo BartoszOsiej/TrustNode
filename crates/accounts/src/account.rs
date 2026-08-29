@@ -147,7 +147,7 @@ pub fn token_program_id() -> Pubkey {
 /// Generate a random pubkey (for testing)
 pub fn random_pubkey() -> Pubkey {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut key = [0u8; 32];
     rng.fill(&mut key);
     key

@@ -69,6 +69,7 @@ struct ValidatorState {
     poh: PohHasher,
     /// Accounts database
     accounts: Arc<AccountsDB>,
+    #[allow(dead_code)]
     /// Transaction executor
     executor: Arc<Executor>,
     /// Tower BFT consensus
@@ -118,6 +119,7 @@ impl ValidatorState {
     }
 
     /// Process a transaction
+    #[allow(dead_code)]
     fn process_transaction(&self, tx: &Transaction) -> solana_tx_processor::TransactionResult {
         self.executor.execute_transaction(tx)
     }
@@ -139,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
     // Generate or parse identity
     let identity: [u8; 32] = if args.identity.is_empty() {
         let mut key = [0u8; 32];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut key);
+        rand::Rng::fill(&mut rand::rng(), &mut key);
         key
     } else {
         let bytes = hex::decode(&args.identity)?;

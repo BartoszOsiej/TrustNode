@@ -134,7 +134,7 @@ impl Crds {
     pub fn random_contacts(&self, count: usize) -> Vec<ContactInfo> {
         use rand::seq::SliceRandom;
         let mut contacts: Vec<ContactInfo> = self.contacts();
-        contacts.shuffle(&mut rand::thread_rng());
+        contacts.shuffle(&mut rand::rng());
         contacts.into_iter().take(count).collect()
     }
 
