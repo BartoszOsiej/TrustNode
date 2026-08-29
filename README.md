@@ -1,4 +1,4 @@
-<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=130&section=header&text=solana-validator&fontSize=36&animation=fadeIn" width="100%" />
+<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=130&section=header&text=TrustNode&fontSize=36&animation=fadeIn" width="100%" />
 
 <div align="center">
 
@@ -57,18 +57,18 @@ flowchart TB
 
 ```bash
 # Build
-git clone https://github.com/BartoszOsiej/solana-validator.git
-cd solana-validator
+git clone https://github.com/BartoszOsiej/TrustNode.git
+cd TrustNode
 cargo build --release
 
 # Run validator (with block production)
-./target/release/solana-validator --mining
+./target/release/trust-node --mining
 
 # Run with RPC on custom port
-./target/release/solana-validator --rpc-port 9000 --gossip-port 8001
+./target/release/trust-node --rpc-port 9000 --gossip-port 8001
 
 # Run benchmarks
-./target/release/solana-validator --bench
+./target/release/trust-node --bench
 ```
 
 ---
