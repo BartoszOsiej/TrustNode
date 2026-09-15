@@ -132,6 +132,7 @@ impl InstructionProcessor {
 mod tests {
     use super::*;
     use crate::instruction::{AccountMeta, Instruction, SystemInstruction};
+    use solana_accounts::account::Account;
 
     fn test_processor() -> InstructionProcessor {
         let accounts = Arc::new(AccountsDB::new());
