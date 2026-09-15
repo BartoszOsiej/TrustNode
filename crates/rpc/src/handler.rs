@@ -518,7 +518,9 @@ mod tests {
             id: Some(serde_json::json!(1)),
         };
         let resp = handler.handle(&req);
-        let sig = resp.result.expect("sendTransaction should return a signature");
+        let sig = resp
+            .result
+            .expect("sendTransaction should return a signature");
         assert!(sig.is_string());
 
         let req = RpcRequest {
