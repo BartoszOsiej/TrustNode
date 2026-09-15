@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solana_accounts::account::Pubkey;
 use solana_accounts::store::AccountsDB;
+use solana_tx_processor::executor::Executor;
+use solana_tx_processor::transaction::Transaction;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// JSON-RPC 2.0 request
@@ -81,17 +84,23 @@ impl RpcResponse {
 /// RPC method handler
 pub struct RpcHandler {
     accounts: Arc<AccountsDB>,
+    executor: Executor,
     slot: parking_lot::RwLock<u64>,
     identity: Pubkey,
+    /// Processed transactions by base58 signature, kept for getTransaction
+    transactions: parking_lot::RwLock<HashMap<String, Value>>,
 }
 
 impl RpcHandler {
     /// Create a new RPC handler
     pub fn new(accounts: Arc<AccountsDB>, identity: Pubkey) -> Self {
+        let executor = Executor::new(accounts.clone());
         Self {
             accounts,
+            executor,
             slot: parking_lot::RwLock::new(0),
             identity,
+            transactions: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -252,12 +261,66 @@ impl RpcHandler {
     }
 
     fn send_transaction(&self, req: &RpcRequest) -> RpcResponse {
-        // Stub: would deserialize and validate transaction
-        RpcResponse::success(req.id.clone(), serde_json::json!("transaction_received"))
+        let params = req.params.as_ref().and_then(|p| p.as_array());
+        let Some(tx_value) = params.and_then(|p| p.first()) else {
+            return RpcResponse::error(
+                req.id.clone(),
+                RpcError::invalid_params("Missing transaction parameter"),
+            );
+        };
+
+        let tx: Transaction = match serde_json::from_value(tx_value.clone()) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return RpcResponse::error(
+                    req.id.clone(),
+                    RpcError::invalid_params(&format!("Invalid transaction: {e}")),
+                );
+            }
+        };
+
+        // Execute against the real executor (validation, fee, instructions)
+        let result = self.executor.execute_transaction(&tx);
+        let signature = bs58_encode(&tx.signature);
+        let slot = *self.slot.read();
+
+        let status = serde_json::json!({
+            "slot": slot,
+            "status": if result.success { "finalized" } else { "failed" },
+            "err": result.error.as_ref().map(|e| e.to_string()),
+            "computeUnitsConsumed": result.compute_units_consumed,
+            "fee": result.fee_paid,
+            "logs": result.logs,
+        });
+
+        self.transactions
+            .write()
+            .insert(signature.clone(), status.clone());
+
+        RpcResponse::success(req.id.clone(), serde_json::json!(signature))
     }
 
     fn get_transaction(&self, req: &RpcRequest) -> RpcResponse {
-        RpcResponse::success(req.id.clone(), Value::Null)
+        let params = req.params.as_ref().and_then(|p| p.as_array());
+        let Some(sig) = params.and_then(|p| p.first()).and_then(|p| p.as_str()) else {
+            return RpcResponse::error(
+                req.id.clone(),
+                RpcError::invalid_params("Missing signature parameter"),
+            );
+        };
+
+        let txs = self.transactions.read();
+        match txs.get(sig) {
+            Some(status) => RpcResponse::success(
+                req.id.clone(),
+                serde_json::json!({
+                    "slot": status["slot"],
+                    "transaction": { "signature": sig },
+                    "meta": status,
+                }),
+            ),
+            None => RpcResponse::success(req.id.clone(), Value::Null),
+        }
     }
 
     fn get_block_height(&self, req: &RpcRequest) -> RpcResponse {
@@ -284,6 +347,50 @@ impl RpcHandler {
     /// Update the current slot (called by the validator)
     pub fn update_slot(&self, slot: u64) {
         *self.slot.write() = slot;
+    }
+}
+
+/// Minimal base58 encoder (Bitcoin alphabet) — no external dependency.
+fn bs58_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let zeros = bytes.iter().take_while(|b| **b == 0).count();
+    let mut digits: Vec<u8> = Vec::with_capacity(bytes.len() * 2);
+    for &byte in &bytes[zeros..] {
+        let mut carry = byte as usize;
+        for digit in digits.iter_mut() {
+            carry += 256 * (*digit as usize);
+            *digit = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 {
+            digits.push((carry % 58) as u8);
+            carry /= 58;
+        }
+    }
+    let mut out = String::with_capacity(zeros + digits.len());
+    for _ in 0..zeros {
+        out.push('1');
+    }
+    for &digit in digits.iter().rev() {
+        out.push(ALPHABET[usize::from(digit)] as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod bs58_tests {
+    use super::bs58_encode;
+
+    #[test]
+    fn encodes_known_vectors() {
+        assert_eq!(bs58_encode(&[]), "");
+        assert_eq!(bs58_encode(&[0, 0]), "11");
+        assert_eq!(bs58_encode(&[0x61]), "2g");
+        // "hello world"
+        assert_eq!(bs58_encode(b"hello world"), "StV1DL6CwTryKyV");
     }
 }
 
@@ -383,5 +490,81 @@ mod tests {
         let resp = handler.handle(&req);
         let result = resp.result.unwrap();
         assert_eq!(result["lamports"], 500);
+    }
+
+    #[test]
+    fn test_send_and_get_transaction() {
+        let db = Arc::new(AccountsDB::new());
+        let handler = RpcHandler::new(db, [0u8; 32]);
+
+        let tx = serde_json::json!({
+            "signature": vec![7u8; 64],
+            "signer": vec![9u8; 32],
+            "instructions": [{
+                "program_id": vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                "accounts": [],
+                "data": []
+            }],
+            "recent_blockhash": vec![0u8; 32],
+            "compute_budget": 200000,
+            "fee": 5000
+        });
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "sendTransaction".to_string(),
+            params: Some(serde_json::json!([tx])),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = handler.handle(&req);
+        let sig = resp.result.expect("sendTransaction should return a signature");
+        assert!(sig.is_string());
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "getTransaction".to_string(),
+            params: Some(serde_json::json!([sig])),
+            id: Some(serde_json::json!(2)),
+        };
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["meta"]["status"], "finalized");
+        assert_eq!(result["meta"]["fee"], 5000);
+    }
+
+    #[test]
+    fn test_send_transaction_rejects_invalid() {
+        let db = Arc::new(AccountsDB::new());
+        let handler = RpcHandler::new(db, [0u8; 32]);
+
+        // No instructions -> executor rejects it
+        let tx = serde_json::json!({
+            "signature": vec![1u8; 64],
+            "signer": vec![9u8; 32],
+            "instructions": [],
+            "recent_blockhash": vec![0u8; 32],
+            "compute_budget": 200000,
+            "fee": 5000
+        });
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "sendTransaction".to_string(),
+            params: Some(serde_json::json!([tx])),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = handler.handle(&req);
+        let sig = resp.result.unwrap();
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "getTransaction".to_string(),
+            params: Some(serde_json::json!([sig])),
+            id: Some(serde_json::json!(2)),
+        };
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["meta"]["status"], "failed");
+        assert!(result["meta"]["err"].is_string());
     }
 }

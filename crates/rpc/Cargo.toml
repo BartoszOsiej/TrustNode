@@ -7,6 +7,7 @@ description = "JSON-RPC server for the validator"
 [dependencies]
 solana-poh = { path = "../poh" }
 solana-accounts = { path = "../accounts" }
+solana-tx-processor = { path = "../tx-processor" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
