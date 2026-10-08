@@ -326,7 +326,7 @@ mod tests {
         protocol.handle_message(push_msg).await.unwrap();
 
         // Should be in CRDS
-        assert!(crds.len() > 0);
+        assert!(!crds.is_empty());
     }
 
     #[tokio::test]

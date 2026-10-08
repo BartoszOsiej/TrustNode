@@ -50,7 +50,7 @@ impl AccountsDB {
 
     /// Store or update an account
     pub fn store(&self, pubkey: Pubkey, account: &Account) {
-        let serialized = bincode::serialize(account).expect("Failed to serialize account");
+        let serialized = serde_json::to_vec(account).expect("Failed to serialize account");
         let length = serialized.len() as u64;
 
         let write_version = {
@@ -93,7 +93,7 @@ impl AccountsDB {
             return None;
         }
 
-        bincode::deserialize(&storage[start..end]).ok()
+        serde_json::from_slice(&storage[start..end]).ok()
     }
 
     /// Check if an account exists

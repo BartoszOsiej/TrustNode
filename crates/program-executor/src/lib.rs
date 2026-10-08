@@ -90,7 +90,9 @@ mod tests {
 
     #[test]
     fn test_compute_budget() {
-        assert!(MAX_COMPUTE_UNITS > DEFAULT_COMPUTE_UNITS);
-        assert!(DEFAULT_COMPUTE_UNITS > 0);
+        const {
+            assert!(MAX_COMPUTE_UNITS > DEFAULT_COMPUTE_UNITS);
+            assert!(DEFAULT_COMPUTE_UNITS > 0);
+        }
     }
 }

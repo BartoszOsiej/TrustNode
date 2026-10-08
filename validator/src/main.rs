@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use solana_accounts::account::{Account, Pubkey};
 use solana_accounts::AccountsDB;
+use solana_blockstore::Blockstore;
 use solana_consensus::leader::{LeaderSchedule, ValidatorStake as LeaderStake};
 use solana_consensus::tower::Tower;
 use solana_gossip::Crds;
@@ -61,6 +62,10 @@ struct Args {
     /// Run benchmarks
     #[arg(long)]
     bench: bool,
+
+    /// Ledger directory (persistent blockstore)
+    #[arg(long, default_value = "ledger")]
+    ledger: String,
 }
 
 /// Validator state
@@ -82,10 +87,12 @@ struct ValidatorState {
     block_height: u64,
     /// Identity
     identity: [u8; 32],
+    /// Persistent ledger
+    ledger: Blockstore,
 }
 
 impl ValidatorState {
-    fn new(identity: [u8; 32]) -> Self {
+    fn new(identity: [u8; 32], ledger_dir: &str) -> anyhow::Result<Self> {
         let accounts = Arc::new(AccountsDB::new());
         let executor = Arc::new(Executor::new(accounts.clone()));
         let tower = Arc::new(Tower::new(0));
@@ -98,19 +105,44 @@ impl ValidatorState {
 
         let leader_schedule = LeaderSchedule::new(validators, 4, 432_000);
 
-        let genesis_hash = PohHash::from_seed("genesis");
-        let poh = PohHasher::new(genesis_hash, 0);
+        // Replay the ledger: resume slot/height and reseed the PoH clock
+        // from the last persisted block so the hash chain continues cleanly.
+        let ledger = Blockstore::open(ledger_dir)?;
+        let replayed = ledger.len();
+        let (current_slot, block_height, poh_seed) = match ledger.last() {
+            Some(last) => (last.slot + 1, last.height + 1, PohHash::new(last.poh_hash)),
+            None => (0, 0, PohHash::from_seed("genesis")),
+        };
+        if replayed > 0 {
+            let last = ledger.last().expect("replayed > 0");
+            tracing::info!(
+                "Ledger: replayed {} blocks from {} (resuming at slot {})",
+                replayed,
+                ledger.dir().display(),
+                current_slot,
+            );
+            tracing::info!(
+                "Last block: height {} hash {}",
+                last.height,
+                &hex::encode(last.block_hash)[..16],
+            );
+        } else {
+            tracing::info!("Ledger: fresh at {}", ledger.dir().display());
+        }
 
-        Self {
+        let poh = PohHasher::new(poh_seed, current_slot);
+
+        Ok(Self {
             poh,
             accounts,
             executor,
             tower,
             leader_schedule,
-            current_slot: 0,
-            block_height: 0,
+            current_slot,
+            block_height,
             identity,
-        }
+            ledger,
+        })
     }
 
     /// Process a tick (PoH heartbeat)
@@ -166,7 +198,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize state
-    let state = Arc::new(parking_lot::RwLock::new(ValidatorState::new(identity)));
+    let state = Arc::new(parking_lot::RwLock::new(ValidatorState::new(
+        identity,
+        &args.ledger,
+    )?));
 
     // Initialize CRDS
     let _crds = Arc::new(Crds::default_store());
@@ -279,12 +314,24 @@ async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
 
     // Get current hash
     let block_hash = s.poh.current();
+    let poh_hash = *block_hash.as_bytes();
 
-    tracing::info!(
-        "📦 Producing block at slot {} | hash: {}",
-        s.current_slot,
-        &block_hash.to_hex()[..16],
-    );
+    // Persist to the blockstore before acknowledging the block
+    let slot = s.current_slot;
+    let height = s.block_height;
+    match s.ledger.append(slot, height, 1, 0, poh_hash) {
+        Ok(record) => {
+            tracing::info!(
+                "📦 Produced block at slot {} | height {} | hash {}",
+                record.slot,
+                record.height,
+                &hex::encode(record.block_hash)[..16],
+            );
+        }
+        Err(err) => {
+            tracing::error!("Ledger append failed at slot {}: {}", slot, err);
+        }
+    }
 
     // Advance slot
     s.current_slot += 1;
@@ -308,6 +355,7 @@ fn print_validator_info(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
     tracing::info!("│ Accounts:     {:>28} │", s.accounts.account_count());
     tracing::info!("│ PoH Hashes:   {:>28} │", s.poh.count());
     tracing::info!("│ Tower Nodes:  {:>28} │", s.tower.stats().total_nodes);
+    tracing::info!("│ Ledger Blocks:{:>28} │", s.ledger.len());
     tracing::info!("└─────────────────────────────────────────────┘");
     tracing::info!("");
 }

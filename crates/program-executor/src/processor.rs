@@ -131,7 +131,7 @@ impl InstructionProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instruction::{AccountMeta, Instruction, SystemInstruction};
+    use crate::instruction::{Instruction, SystemInstruction};
     use solana_accounts::account::Account;
 
     fn test_processor() -> InstructionProcessor {

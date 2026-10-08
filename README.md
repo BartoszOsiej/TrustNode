@@ -3,7 +3,8 @@
 <div align="center">
 
 [![Rust](https://img.shields.io/badge/Rust-2021-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-110_passed-00ff00?style=flat-square)](#-test-results)
+[![Tests](https://img.shields.io/badge/tests-127_passed-00ff00?style=flat-square)](#-test-results)
+[![CI](https://img.shields.io/badge/CI-clippy_-D_%7C_fmt_%7C_doc_%7C_audit-0A84FF?style=flat-square)](../../actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
 **A custom Solana-like validator built from scratch in Rust — PoH clock, Tower BFT consensus, Sealevel parallel execution, Turbine block propagation with Reed-Solomon erasure coding, CRDS gossip protocol, and a SBF-inspired program executor.**
@@ -76,7 +77,7 @@ cargo build --release
 ## 📁 Workspace Structure
 
 ```
-solana-validator/
+TrustNode/
 ├── crates/
 │   ├── poh/                    # Proof of History clock
 │   │   ├── hasher.rs           # SHA-256 hash chain engine
@@ -87,6 +88,9 @@ solana-validator/
 │   │   ├── account.rs          # Account types (System, Token, Program)
 │   │   ├── store.rs            # Append-only DB with DashMap index
 │   │   └── merkle.rs           # Merkle tree for state root
+│   ├── blockstore/             # Persistent block store
+│   │   ├── record.rs           # Block record + hash chaining
+│   │   └── store.rs            # TNBL framed log, crash-safe replay
 │   ├── tx-processor/           # Transaction execution
 │   │   ├── transaction.rs      # Transaction types + conflict detection
 │   │   ├── scheduler.rs        # Sealevel-like parallel batching
@@ -149,10 +153,15 @@ test result: ok. 12 passed; 0 failed   (solana-tx-processor)
 test result: ok. 17 passed; 0 failed   (solana-consensus)
 test result: ok. 16 passed; 0 failed   (solana-turbine)
 test result: ok. 10 passed; 0 failed   (solana-gossip)
-test result: ok.  6 passed; 0 failed   (solana-rpc)
+test result: ok.  9 passed; 0 failed   (solana-rpc)
 test result: ok. 17 passed; 0 failed   (solana-program-executor)
-─────────────────────────────────────
-           110 passed; 0 failed
+test result: ok. 14 passed; 0 failed   (solana-blockstore)
+────────────────────────────────────
+           127 passed; 0 failed
+
+Gates: cargo fmt --check · cargo clippy --all-targets -- -D warnings
+       cargo doc --no-deps (-D warnings) · cargo audit (0 findings)
+CI runs them on Linux + macOS with --locked (.github/workflows/ci.yml).
 ```
 
 ---
@@ -170,6 +179,7 @@ Options:
   --mining                 Enable block production
   --rpc-enabled            Enable JSON-RPC API [default: true]
   --bench                  Run performance benchmarks
+  --ledger <DIR>           Ledger directory (persistent blockstore) [default: ledger]
 ```
 
 ---

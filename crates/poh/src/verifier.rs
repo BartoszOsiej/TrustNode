@@ -183,7 +183,7 @@ impl Default for PohVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::{EntryData, PohEntry};
+    use crate::entry::PohEntry;
 
     /// Helper: create a chain of tick entries
     fn make_chained_entries(count: usize, slot: u64) -> Vec<PohEntry> {

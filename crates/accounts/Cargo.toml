@@ -8,7 +8,7 @@ description = "Accounts database — append-only state storage"
 solana-poh = { path = "../poh" }
 sha2 = { workspace = true }
 serde = { workspace = true }
-bincode = { workspace = true }
+serde_json = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 hex = { workspace = true }

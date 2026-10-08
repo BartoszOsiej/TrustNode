@@ -10,7 +10,6 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-bincode = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }

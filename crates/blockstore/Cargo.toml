@@ -1,0 +1,12 @@
+[package]
+name = "solana-blockstore"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent blockstore — append-only ledger with replay, hash chaining and torn-write recovery"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

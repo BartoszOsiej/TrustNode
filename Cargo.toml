@@ -8,6 +8,7 @@ members = [
     "crates/gossip",
     "crates/rpc",
     "crates/program-executor",
+    "crates/blockstore",
     "validator",
 ]
 resolver = "2"
@@ -22,7 +23,6 @@ rand = "0.10"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 hex = "0.4"
-bincode = "3.0"
 ed25519-dalek = { version = "3", features = ["serde"] }
 curve25519-dalek = "5"
 parking_lot = "0.12"

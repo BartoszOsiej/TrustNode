@@ -199,7 +199,7 @@ mod tests {
 
         let neighborhood = Arc::new(RwLock::new(Neighborhood::build_tree(validators, 5)));
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
 
         let propagator = TurbinePropagator::new([1u8; 32], neighborhood, tx);
 
