@@ -7,6 +7,7 @@ description = "Transaction processor — Sealevel-like parallel execution"
 [dependencies]
 solana-poh = { path = "../poh" }
 solana-accounts = { path = "../accounts" }
+solana-program-executor = { path = "../program-executor" }
 sha2 = { workspace = true }
 serde = { workspace = true }
 parking_lot = { workspace = true }

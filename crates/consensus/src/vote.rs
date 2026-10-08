@@ -1,5 +1,6 @@
 //! Vote data structures for Tower BFT
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -63,19 +64,43 @@ impl Vote {
         bytes
     }
 
-    /// Get the data to sign
+    /// Get the data covered by the Ed25519 signature: identity, slot,
+    /// block hash, parent slot, timestamp and vote state hash.
     pub fn signable_data(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&self.validator);
         data.extend_from_slice(&self.slot.to_le_bytes());
         data.extend_from_slice(&self.block_hash);
+        match self.parent_slot {
+            Some(parent) => {
+                data.push(1);
+                data.extend_from_slice(&parent.to_le_bytes());
+            }
+            None => data.push(0),
+        }
         data.extend_from_slice(&self.timestamp.to_le_bytes());
+        data.extend_from_slice(&self.state_hash);
         data
     }
 
-    /// Verify vote signature (stub — in real impl, use Ed25519)
+    /// Sign this vote with the validator's Ed25519 key. Rebinds `validator`
+    /// to the key's public key and recomputes the vote state hash so the
+    /// vote stays self-consistent.
+    pub fn sign(&mut self, key: &SigningKey) {
+        self.validator = key.verifying_key().to_bytes();
+        self.state_hash = Self::compute_state_hash(self.validator, self.slot, self.block_hash);
+        self.signature = key.sign(&self.signable_data()).to_bytes().to_vec();
+    }
+
+    /// Verify the vote's Ed25519 signature against its validator identity.
     pub fn verify_signature(&self) -> bool {
-        !self.signature.is_empty()
+        let Ok(vk) = VerifyingKey::from_bytes(&self.validator) else {
+            return false;
+        };
+        let Ok(sig) = Signature::from_slice(&self.signature) else {
+            return false;
+        };
+        vk.verify_strict(&self.signable_data(), &sig).is_ok()
     }
 }
 
@@ -283,5 +308,50 @@ mod tests {
         assert_eq!(state.root_slot, 5);
         // History should only contain entries with slot >= 5
         assert!(state.history.iter().all(|e| e.slot >= 5));
+    }
+
+    fn test_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    #[test]
+    fn test_vote_signature_roundtrip() {
+        let sk = test_key(9);
+        let mut vote = Vote::new([0u8; 32], 10, [42u8; 32], Some(9));
+        vote.sign(&sk);
+
+        assert_eq!(vote.validator, sk.verifying_key().to_bytes());
+        assert!(vote.verify_signature());
+
+        // Tampering with covered fields invalidates the signature
+        vote.slot = 11;
+        assert!(!vote.verify_signature());
+        vote.slot = 10;
+        assert!(vote.verify_signature());
+
+        vote.timestamp += 1;
+        assert!(!vote.verify_signature());
+        vote.timestamp -= 1;
+        vote.signature = vec![];
+        assert!(!vote.verify_signature());
+        vote.signature = vec![1u8; 64];
+        assert!(!vote.verify_signature());
+    }
+
+    #[test]
+    fn test_vote_signed_by_wrong_key_rejected() {
+        let sk = test_key(9);
+        let mut vote = Vote::new([0u8; 32], 10, [42u8; 32], Some(9));
+        vote.sign(&sk);
+        // Impersonate another validator after signing
+        vote.validator = test_key(10).verifying_key().to_bytes();
+        assert!(!vote.verify_signature());
+    }
+
+    #[test]
+    fn test_unsigned_vote_rejected() {
+        let vote = Vote::new(test_validator(), 10, [42u8; 32], Some(9));
+        assert!(vote.signature.is_empty());
+        assert!(!vote.verify_signature());
     }
 }

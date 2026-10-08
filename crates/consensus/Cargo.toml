@@ -12,6 +12,7 @@ serde = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
 hex = { workspace = true }
+ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }

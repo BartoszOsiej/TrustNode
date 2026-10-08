@@ -494,27 +494,46 @@ mod tests {
 
     #[test]
     fn test_send_and_get_transaction() {
-        let db = Arc::new(AccountsDB::new());
-        let handler = RpcHandler::new(db, [0u8; 32]);
+        use solana_tx_processor::transaction::{AccountMeta, Instruction};
 
-        let tx = serde_json::json!({
-            "signature": vec![7u8; 64],
-            "signer": vec![9u8; 32],
-            "instructions": [{
-                "program_id": vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                "accounts": [],
-                "data": []
-            }],
-            "recent_blockhash": vec![0u8; 32],
-            "compute_budget": 200000,
-            "fee": 5000
-        });
+        let db = Arc::new(AccountsDB::new());
+        let handler = RpcHandler::new(db.clone(), [0u8; 32]);
+
+        // Real Ed25519-signed transfer between funded accounts
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let signer = sk.verifying_key().to_bytes();
+        let recipient = [7u8; 32];
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        let ix = Instruction {
+            program_id: [1u8; 32],
+            accounts: vec![
+                AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    index: 1,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            data: solana_program_executor::instruction::SystemInstruction::Transfer {
+                lamports: 500,
+            }
+            .to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.account_keys.push(recipient);
+        tx.sign(&sk);
+        assert!(tx.verify_signature());
+        let tx_value = serde_json::to_value(&tx).unwrap();
 
         let req = RpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "sendTransaction".to_string(),
-            params: Some(serde_json::json!([tx])),
+            params: Some(serde_json::json!([tx_value])),
             id: Some(serde_json::json!(1)),
         };
         let resp = handler.handle(&req);
@@ -531,8 +550,16 @@ mod tests {
         };
         let resp = handler.handle(&req);
         let result = resp.result.unwrap();
-        assert_eq!(result["meta"]["status"], "finalized");
+        assert_eq!(
+            result["meta"]["status"], "finalized",
+            "err={} logs={:?}",
+            result["meta"]["err"], result["meta"]["logs"]
+        );
         assert_eq!(result["meta"]["fee"], 5000);
+
+        // The transfer and the fee really hit the accounts DB
+        assert_eq!(db.load(&signer).unwrap().lamports, 10_000_000 - 5_000 - 500);
+        assert_eq!(db.load(&recipient).unwrap().lamports, 500);
     }
 
     #[test]

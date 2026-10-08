@@ -624,6 +624,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
+ "ed25519-dalek",
  "hex",
  "parking_lot",
  "rand",
@@ -641,10 +642,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dashmap",
+ "ed25519-dalek",
  "hex",
  "parking_lot",
  "rand",
  "serde",
+ "serde_json",
  "sha2",
  "solana-poh",
  "tokio",
@@ -684,12 +687,14 @@ name = "solana-rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "hex",
  "parking_lot",
  "serde",
  "serde_json",
  "solana-accounts",
  "solana-poh",
+ "solana-program-executor",
  "solana-tx-processor",
  "tokio",
  "tracing",
@@ -725,6 +730,7 @@ dependencies = [
  "sha2",
  "solana-accounts",
  "solana-poh",
+ "solana-program-executor",
  "tokio",
  "tracing",
 ]
@@ -735,6 +741,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ed25519-dalek",
  "hex",
  "parking_lot",
  "rand",

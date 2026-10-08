@@ -55,6 +55,17 @@ impl Tower {
 
     /// Process a vote
     pub fn process_vote(&self, vote: Vote) -> bool {
+        // Byzantine guard: a vote that isn't Ed25519-signed by its claimed
+        // validator identity is rejected before it touches any state.
+        if !vote.verify_signature() {
+            tracing::warn!(
+                "Rejected unsigned or forged vote for slot {} from {}",
+                vote.slot,
+                hex::encode(&vote.validator[..8])
+            );
+            return false;
+        }
+
         // Get or create validator state
         let mut validator_state = self
             .validator_states
@@ -230,6 +241,21 @@ mod tests {
         v
     }
 
+    fn test_key(seed_byte: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    fn signed_vote(
+        sk: &ed25519_dalek::SigningKey,
+        slot: u64,
+        block_hash: [u8; 32],
+        parent_slot: Option<u64>,
+    ) -> Vote {
+        let mut vote = Vote::new(sk.verifying_key().to_bytes(), slot, block_hash, parent_slot);
+        vote.sign(sk);
+        vote
+    }
+
     #[test]
     fn test_tower_creation() {
         let tower = Tower::new(0);
@@ -241,10 +267,32 @@ mod tests {
     #[test]
     fn test_single_vote() {
         let tower = Tower::new(0);
-        let validator = test_validator(1);
-        let vote = Vote::new(validator, 10, [42u8; 32], None);
+        let sk = test_key(1);
+        let vote = signed_vote(&sk, 10, [42u8; 32], None);
 
         assert!(tower.process_vote(vote));
+        assert_eq!(tower.stats().total_votes, 1);
+    }
+
+    #[test]
+    fn test_unsigned_and_forged_votes_rejected() {
+        let tower = Tower::new(0);
+
+        // Never signed — rejected
+        let unsigned = Vote::new(test_validator(1), 10, [42u8; 32], None);
+        assert!(!tower.process_vote(unsigned));
+        assert_eq!(tower.stats().total_votes, 0);
+
+        // Signed by key A but attributed to validator B — rejected
+        let sk = test_key(1);
+        let mut forged = signed_vote(&sk, 10, [42u8; 32], None);
+        forged.validator = test_validator(9);
+        assert!(!tower.process_vote(forged));
+        assert_eq!(tower.stats().total_votes, 0);
+        assert_eq!(tower.stats().total_validators, 0);
+
+        // Correctly signed vote still goes through
+        assert!(tower.process_vote(signed_vote(&sk, 10, [42u8; 32], None)));
         assert_eq!(tower.stats().total_votes, 1);
     }
 
@@ -253,8 +301,8 @@ mod tests {
         let tower = Tower::new(0);
 
         for i in 0..5 {
-            let validator = test_validator(i);
-            let vote = Vote::new(validator, 10, [42u8; 32], None);
+            let sk = test_key(i);
+            let vote = signed_vote(&sk, 10, [42u8; 32], None);
             tower.process_vote(vote);
         }
 
@@ -272,15 +320,15 @@ mod tests {
 
         // Fork A: 3 votes
         for i in 0..3 {
-            let validator = test_validator(i);
-            let vote = Vote::new(validator, 10, [1u8; 32], None);
+            let sk = test_key(i);
+            let vote = signed_vote(&sk, 10, [1u8; 32], None);
             tower.process_vote(vote);
         }
 
         // Fork B: 5 votes
         for i in 3..8 {
-            let validator = test_validator(i);
-            let vote = Vote::new(validator, 10, [2u8; 32], None);
+            let sk = test_key(i);
+            let vote = signed_vote(&sk, 10, [2u8; 32], None);
             tower.process_vote(vote);
         }
 

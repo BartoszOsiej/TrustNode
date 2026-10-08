@@ -170,17 +170,23 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // Generate or parse identity
-    let identity: [u8; 32] = if args.identity.is_empty() {
-        let mut key = [0u8; 32];
-        rand::RngExt::fill(&mut rand::rng(), &mut key);
-        key
+    // Identity: a 32-byte Ed25519 *seed* in hex. The validator's public
+    // identity is derived from it — there is no unkeyed identity.
+    let signing_key = if args.identity.is_empty() {
+        let mut seed = [0u8; 32];
+        rand::RngExt::fill(&mut rand::rng(), &mut seed);
+        ed25519_dalek::SigningKey::from_bytes(&seed)
     } else {
         let bytes = hex::decode(&args.identity)?;
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        key
+        let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+            anyhow::anyhow!(
+                "--identity must be a 32-byte hex seed, got {} bytes",
+                bytes.len()
+            )
+        })?;
+        ed25519_dalek::SigningKey::from_bytes(&seed)
     };
+    let identity = signing_key.verifying_key().to_bytes();
 
     tracing::info!("╔══════════════════════════════════════════════╗");
     tracing::info!("║     🔒 SOLANA-LIKE VALIDATOR v0.1.0         ║");
@@ -193,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Run benchmarks if requested
     if args.bench {
-        run_benchmarks().await;
+        run_benchmarks(&signing_key).await;
         return Ok(());
     }
 
@@ -361,7 +367,7 @@ fn print_validator_info(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
 }
 
 /// Run performance benchmarks
-async fn run_benchmarks() {
+async fn run_benchmarks(signing_key: &ed25519_dalek::SigningKey) {
     tracing::info!("Running benchmarks...");
     tracing::info!("");
 
@@ -428,36 +434,57 @@ async fn run_benchmarks() {
         tracing::info!("Erasure coding (100 encode/decode): {:.2?}", elapsed);
     }
 
-    // Transaction execution benchmark
+    // Transaction execution benchmark — real signed transfers through the
+    // native dispatcher (signature verification + fee deduction included)
     {
         let db = Arc::new(AccountsDB::new());
         let executor = Arc::new(Executor::new(db.clone()));
 
-        let signer: Pubkey = {
-            let mut key = [0u8; 32];
-            key[0] = 42;
-            key
-        };
-        let acc = Account::new_system_account(signer, 10_000_000);
+        let signer: Pubkey = signing_key.verifying_key().to_bytes();
+        let recipient: Pubkey = [7u8; 32];
+        // Must cover 10k × (5000 fee + 100 transfer)
+        let acc = Account::new_system_account(signer, 1_000_000_000);
         db.store(signer, &acc);
 
         let start = std::time::Instant::now();
-        for _ in 0..10_000 {
+        for i in 0..10_000u64 {
             let ix = Instruction {
                 program_id: [1u8; 32], // System program
-                accounts: vec![AccountMeta {
-                    index: 0,
-                    is_signer: true,
-                    is_writable: true,
-                }],
-                data: vec![],
+                accounts: vec![
+                    AccountMeta {
+                        index: 0,
+                        is_signer: true,
+                        is_writable: true,
+                    },
+                    AccountMeta {
+                        index: 1,
+                        is_signer: false,
+                        is_writable: true,
+                    },
+                ],
+                data: solana_program_executor::instruction::SystemInstruction::Transfer {
+                    lamports: 100,
+                }
+                .to_data(),
             };
             let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
-            tx.signature = vec![1u8; 64];
-            let _result = executor.execute_transaction(&tx);
+            tx.account_keys.push(recipient);
+            tx.recent_blockhash = {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                h
+            };
+            tx.sign(signing_key);
+            let result = executor.execute_transaction(&tx);
+            assert!(result.success, "bench tx {} failed: {:?}", i, result.error);
         }
         let elapsed = start.elapsed();
-        tracing::info!("Transaction execution (10k txs): {:.2?}", elapsed);
+        tracing::info!("Transaction execution (10k signed txs): {:.2?}", elapsed);
+        tracing::info!(
+            "Post-bench balances: signer={} recipient={}",
+            db.load(&signer).map(|a| a.lamports).unwrap_or(0),
+            db.load(&recipient).map(|a| a.lamports).unwrap_or(0),
+        );
     }
 
     tracing::info!("");

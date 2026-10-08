@@ -6,7 +6,7 @@
 //! - Account assignment to programs
 //! - Nonce operations
 
-use crate::instruction::{AccountMeta, SystemInstruction};
+use crate::instruction::{resolve_account_key, AccountMeta, SystemInstruction};
 use crate::processor::ComputeBudget;
 use crate::InstructionError;
 use solana_accounts::account::{Account, AccountData, Pubkey};
@@ -20,6 +20,7 @@ pub fn process_instruction(
     data: &[u8],
     account_metas: &[AccountMeta],
     signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -27,9 +28,15 @@ pub fn process_instruction(
     let instruction = SystemInstruction::from_data(data)?;
 
     match instruction {
-        SystemInstruction::Transfer { lamports } => {
-            process_transfer(lamports, account_metas, signer, accounts, budget, logs)
-        }
+        SystemInstruction::Transfer { lamports } => process_transfer(
+            lamports,
+            account_metas,
+            signer,
+            account_keys,
+            accounts,
+            budget,
+            logs,
+        ),
         SystemInstruction::CreateAccount {
             lamports,
             space,
@@ -40,17 +47,25 @@ pub fn process_instruction(
             owner,
             account_metas,
             signer,
+            account_keys,
             accounts,
             budget,
             logs,
         ),
-        SystemInstruction::Assign { owner } => {
-            process_assign(owner, account_metas, signer, accounts, budget, logs)
-        }
+        SystemInstruction::Assign { owner } => process_assign(
+            owner,
+            account_metas,
+            signer,
+            account_keys,
+            accounts,
+            budget,
+            logs,
+        ),
         SystemInstruction::NonceInitialize => {
-            logs.push("NonceInitialize (stub)".to_string());
-            budget.consume(100)?;
-            Ok(())
+            logs.push("NonceInitialize: durable nonce accounts are not implemented".to_string());
+            Err(InstructionError::InvalidInstructionData(
+                "nonce accounts are not implemented".to_string(),
+            ))
         }
     }
 }
@@ -60,6 +75,7 @@ fn process_transfer(
     lamports: u64,
     account_metas: &[AccountMeta],
     signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -76,7 +92,7 @@ fn process_transfer(
     let to_meta = &account_metas[1];
 
     // Load source account
-    let from_pubkey = get_account_key(from_meta.index)?;
+    let from_pubkey = resolve_account_key(from_meta.index, account_keys)?;
     if &from_pubkey != signer && !from_meta.is_signer {
         return Err(InstructionError::ProgramError(
             "Source account not signed".to_string(),
@@ -94,7 +110,7 @@ fn process_transfer(
         });
     }
 
-    let to_pubkey = get_account_key(to_meta.index)?;
+    let to_pubkey = resolve_account_key(to_meta.index, account_keys)?;
 
     // Deduct from source
     from_account.lamports -= lamports;
@@ -125,6 +141,7 @@ fn process_create_account(
     owner: Pubkey,
     account_metas: &[AccountMeta],
     signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -140,8 +157,8 @@ fn process_create_account(
     let payer_meta = &account_metas[0];
     let new_account_meta = &account_metas[1];
 
-    let payer_pubkey = get_account_key(payer_meta.index)?;
-    let new_account_pubkey = get_account_key(new_account_meta.index)?;
+    let payer_pubkey = resolve_account_key(payer_meta.index, account_keys)?;
+    let new_account_pubkey = resolve_account_key(new_account_meta.index, account_keys)?;
 
     // Payer must be signer
     if &payer_pubkey != signer && !payer_meta.is_signer {
@@ -200,6 +217,7 @@ fn process_assign(
     owner: Pubkey,
     account_metas: &[AccountMeta],
     signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -212,7 +230,7 @@ fn process_assign(
         ));
     }
 
-    let account_pubkey = get_account_key(account_metas[0].index)?;
+    let account_pubkey = resolve_account_key(account_metas[0].index, account_keys)?;
 
     // Must be signer
     if &account_pubkey != signer && !account_metas[0].is_signer {
@@ -242,16 +260,6 @@ fn process_assign(
     Ok(())
 }
 
-/// Helper: get a pubkey from an account index (simplified — uses index as seed)
-pub fn get_account_key(index: usize) -> Result<Pubkey, InstructionError> {
-    // In a real implementation, this would look up the actual account key
-    // from the transaction's account list. For now, derive a deterministic key.
-    let mut key = [0u8; 32];
-    key[0] = 0xFF; // avoid collision with system program [1u8; 32]
-    key[1] = (index + 1) as u8;
-    Ok(key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,13 +277,13 @@ mod tests {
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
 
-        // Create source account
-        let from_key = get_account_key(0).unwrap();
+        // Real account keys, resolved by index from the transaction
+        let from_key = [10u8; 32];
+        let to_key = [11u8; 32];
+        let keys = [from_key, to_key];
+
         let from_acc = Account::new_system_account(from_key, 1_000_000);
         accounts.store(from_key, &from_acc);
-
-        // Create dest account
-        let to_key = get_account_key(1).unwrap();
         let to_acc = Account::new_system_account(to_key, 0);
         accounts.store(to_key, &to_acc);
 
@@ -288,6 +296,7 @@ mod tests {
             &SystemInstruction::Transfer { lamports: 500 }.to_data(),
             &metas,
             &from_key,
+            &keys,
             &accounts,
             &mut budget,
             &mut logs,
@@ -299,16 +308,42 @@ mod tests {
     }
 
     #[test]
+    fn test_index_out_of_range_is_rejected() {
+        let accounts = test_accounts();
+        let mut budget = ComputeBudget::new(10_000);
+        let mut logs = Vec::new();
+
+        // No keys provided → index 0 cannot resolve: no synthetic fallback
+        let metas = vec![
+            AccountMeta::new(0, true, true),
+            AccountMeta::new(1, false, true),
+        ];
+
+        let result = process_instruction(
+            &SystemInstruction::Transfer { lamports: 500 }.to_data(),
+            &metas,
+            &[10u8; 32],
+            &[],
+            &accounts,
+            &mut budget,
+            &mut logs,
+        );
+
+        assert!(matches!(result, Err(InstructionError::AccountNotFound)));
+    }
+
+    #[test]
     fn test_insufficient_funds() {
         let accounts = test_accounts();
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
 
-        let from_key = get_account_key(0).unwrap();
+        let from_key = [10u8; 32];
+        let to_key = [11u8; 32];
+        let keys = [from_key, to_key];
+
         let from_acc = Account::new_system_account(from_key, 100);
         accounts.store(from_key, &from_acc);
-
-        let to_key = get_account_key(1).unwrap();
         let to_acc = Account::new_system_account(to_key, 0);
         accounts.store(to_key, &to_acc);
 
@@ -321,6 +356,7 @@ mod tests {
             &SystemInstruction::Transfer { lamports: 200 }.to_data(),
             &metas,
             &from_key,
+            &keys,
             &accounts,
             &mut budget,
             &mut logs,
@@ -342,11 +378,12 @@ mod tests {
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
 
-        let payer_key = get_account_key(0).unwrap();
+        let payer_key = [10u8; 32];
+        let new_key = [11u8; 32];
+        let keys = [payer_key, new_key];
+
         let payer_acc = Account::new_system_account(payer_key, 10_000_000);
         accounts.store(payer_key, &payer_acc);
-
-        let new_key = get_account_key(1).unwrap();
 
         let metas = vec![
             AccountMeta::new(0, true, true),
@@ -362,6 +399,7 @@ mod tests {
             .to_data(),
             &metas,
             &payer_key,
+            &keys,
             &accounts,
             &mut budget,
             &mut logs,

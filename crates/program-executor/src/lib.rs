@@ -27,8 +27,8 @@ pub use instruction::{Instruction, InstructionResult};
 pub use processor::InstructionProcessor;
 pub use programs::system_program;
 
-/// Compute budget per instruction
-pub const DEFAULT_COMPUTE_UNITS: u64 = 200;
+/// Compute budget per instruction (dispatch overhead + program charge)
+pub const DEFAULT_COMPUTE_UNITS: u64 = 150_000;
 pub const MAX_COMPUTE_UNITS: u64 = 200_000;
 
 /// Instruction error

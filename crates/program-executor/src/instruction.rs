@@ -58,6 +58,19 @@ impl AccountMeta {
     }
 }
 
+/// Resolve an instruction's account index against the transaction's account
+/// key list. There is no synthetic fallback: an index outside the list is an
+/// error, exactly like a malformed transaction on Solana.
+pub fn resolve_account_key(
+    index: usize,
+    account_keys: &[Pubkey],
+) -> Result<Pubkey, crate::InstructionError> {
+    account_keys
+        .get(index)
+        .copied()
+        .ok_or(crate::InstructionError::AccountNotFound)
+}
+
 /// Result of executing an instruction
 #[derive(Debug, Clone)]
 pub struct InstructionResult {

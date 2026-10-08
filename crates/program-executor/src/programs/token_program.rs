@@ -6,7 +6,7 @@
 //! - Minting tokens
 //! - Burning tokens
 
-use crate::instruction::{AccountMeta, TokenInstruction};
+use crate::instruction::{resolve_account_key, AccountMeta, TokenInstruction};
 use crate::processor::ComputeBudget;
 use crate::InstructionError;
 use solana_accounts::account::{Account, AccountData, Pubkey};
@@ -17,6 +17,7 @@ pub fn process_instruction(
     data: &[u8],
     account_metas: &[AccountMeta],
     signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -27,15 +28,33 @@ pub fn process_instruction(
         TokenInstruction::InitializeAccount => {
             process_initialize_account(account_metas, accounts, budget, logs)
         }
-        TokenInstruction::Transfer { amount } => {
-            process_token_transfer(amount, account_metas, signer, accounts, budget, logs)
-        }
-        TokenInstruction::MintTo { amount } => {
-            process_mint_to(amount, account_metas, signer, accounts, budget, logs)
-        }
-        TokenInstruction::Burn { amount } => {
-            process_burn(amount, account_metas, signer, accounts, budget, logs)
-        }
+        TokenInstruction::Transfer { amount } => process_token_transfer(
+            amount,
+            account_metas,
+            signer,
+            account_keys,
+            accounts,
+            budget,
+            logs,
+        ),
+        TokenInstruction::MintTo { amount } => process_mint_to(
+            amount,
+            account_metas,
+            signer,
+            account_keys,
+            accounts,
+            budget,
+            logs,
+        ),
+        TokenInstruction::Burn { amount } => process_burn(
+            amount,
+            account_metas,
+            signer,
+            account_keys,
+            accounts,
+            budget,
+            logs,
+        ),
     }
 }
 
@@ -56,6 +75,7 @@ fn process_token_transfer(
     amount: u64,
     account_metas: &[AccountMeta],
     _signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -68,8 +88,8 @@ fn process_token_transfer(
         ));
     }
 
-    let from_key = get_token_account_key(account_metas[0].index)?;
-    let to_key = get_token_account_key(account_metas[1].index)?;
+    let from_key = resolve_account_key(account_metas[0].index, account_keys)?;
+    let to_key = resolve_account_key(account_metas[1].index, account_keys)?;
 
     // Load source token account
     let mut from_account = accounts
@@ -140,6 +160,7 @@ fn process_mint_to(
     amount: u64,
     account_metas: &[AccountMeta],
     _signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -152,7 +173,7 @@ fn process_mint_to(
         ));
     }
 
-    let mint_key = get_token_account_key(account_metas[0].index)?;
+    let mint_key = resolve_account_key(account_metas[0].index, account_keys)?;
     let mut mint_account = accounts
         .load(&mint_key)
         .ok_or(InstructionError::AccountNotFound)?;
@@ -189,6 +210,7 @@ fn process_burn(
     amount: u64,
     account_metas: &[AccountMeta],
     _signer: &Pubkey,
+    account_keys: &[Pubkey],
     accounts: &AccountsDB,
     budget: &mut ComputeBudget,
     logs: &mut Vec<String>,
@@ -201,7 +223,7 @@ fn process_burn(
         ));
     }
 
-    let token_key = get_token_account_key(account_metas[0].index)?;
+    let token_key = resolve_account_key(account_metas[0].index, account_keys)?;
     let mut token_account = accounts
         .load(&token_key)
         .ok_or(InstructionError::AccountNotFound)?;
@@ -242,21 +264,12 @@ fn process_burn(
     Ok(())
 }
 
-/// Helper: get token account key from index
-fn get_token_account_key(index: usize) -> Result<Pubkey, InstructionError> {
-    let mut key = [0u8; 32];
-    key[0] = 0xFE; // avoid collision with programs
-    key[1] = (index + 1) as u8;
-    Ok(key)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use solana_accounts::account::AccountData;
 
-    fn setup_token_account(accounts: &AccountsDB, index: usize, amount: u64) -> Pubkey {
-        let key = get_token_account_key(index).unwrap();
+    fn setup_token_account(accounts: &AccountsDB, key: Pubkey, amount: u64) {
         let acc = Account {
             lamports: 1_000_000,
             owner: [2u8; 32], // Token program
@@ -269,7 +282,6 @@ mod tests {
             },
         };
         accounts.store(key, &acc);
-        key
     }
 
     #[test]
@@ -278,16 +290,26 @@ mod tests {
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
 
-        let from_key = setup_token_account(&accounts, 0, 1000);
-        let to_key = setup_token_account(&accounts, 1, 0);
+        let from_key = [20u8; 32];
+        let to_key = [21u8; 32];
+        let keys = [from_key, to_key];
+        setup_token_account(&accounts, from_key, 1000);
+        setup_token_account(&accounts, to_key, 0);
 
         let metas = vec![
             AccountMeta::new(0, true, true),
             AccountMeta::new(1, false, true),
         ];
 
-        let result =
-            process_token_transfer(500, &metas, &from_key, &accounts, &mut budget, &mut logs);
+        let result = process_token_transfer(
+            500,
+            &metas,
+            &from_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        );
 
         assert!(result.is_ok());
 
@@ -303,21 +325,56 @@ mod tests {
     }
 
     #[test]
-    fn test_token_insufficient_balance() {
+    fn test_token_index_out_of_range_is_rejected() {
         let accounts = AccountsDB::new();
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
-
-        let from_key = setup_token_account(&accounts, 0, 100);
-        let _to_key = setup_token_account(&accounts, 1, 0);
 
         let metas = vec![
             AccountMeta::new(0, true, true),
             AccountMeta::new(1, false, true),
         ];
 
-        let result =
-            process_token_transfer(200, &metas, &from_key, &accounts, &mut budget, &mut logs);
+        // Empty key list: index-based synthetic keys are gone
+        let result = process_token_transfer(
+            500,
+            &metas,
+            &[20u8; 32],
+            &[],
+            &accounts,
+            &mut budget,
+            &mut logs,
+        );
+
+        assert!(matches!(result, Err(InstructionError::AccountNotFound)));
+    }
+
+    #[test]
+    fn test_token_insufficient_balance() {
+        let accounts = AccountsDB::new();
+        let mut budget = ComputeBudget::new(10_000);
+        let mut logs = Vec::new();
+
+        let from_key = [20u8; 32];
+        let to_key = [21u8; 32];
+        let keys = [from_key, to_key];
+        setup_token_account(&accounts, from_key, 100);
+        setup_token_account(&accounts, to_key, 0);
+
+        let metas = vec![
+            AccountMeta::new(0, true, true),
+            AccountMeta::new(1, false, true),
+        ];
+
+        let result = process_token_transfer(
+            200,
+            &metas,
+            &from_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        );
 
         assert!(result.is_err());
     }
@@ -328,11 +385,21 @@ mod tests {
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
 
-        let mint_key = setup_token_account(&accounts, 0, 0);
+        let mint_key = [30u8; 32];
+        let keys = [mint_key];
+        setup_token_account(&accounts, mint_key, 0);
 
         let metas = vec![AccountMeta::new(0, true, true)];
 
-        let result = process_mint_to(1000, &metas, &mint_key, &accounts, &mut budget, &mut logs);
+        let result = process_mint_to(
+            1000,
+            &metas,
+            &mint_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        );
 
         assert!(result.is_ok());
 
@@ -348,11 +415,21 @@ mod tests {
         let mut budget = ComputeBudget::new(10_000);
         let mut logs = Vec::new();
 
-        let token_key = setup_token_account(&accounts, 0, 500);
+        let token_key = [30u8; 32];
+        let keys = [token_key];
+        setup_token_account(&accounts, token_key, 500);
 
         let metas = vec![AccountMeta::new(0, true, true)];
 
-        let result = process_burn(200, &metas, &token_key, &accounts, &mut budget, &mut logs);
+        let result = process_burn(
+            200,
+            &metas,
+            &token_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        );
 
         assert!(result.is_ok());
 

@@ -8,6 +8,7 @@ use crate::message::{
     PullResponseData, PushData,
 };
 use dashmap::DashMap;
+use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -17,6 +18,8 @@ pub struct GossipProtocol {
     crds: Arc<Crds>,
     /// This validator's identity
     pub validator_id: [u8; 32],
+    /// Our signing key — every outgoing message is Ed25519-signed
+    signer: Arc<SigningKey>,
     /// Message sender
     msg_sender: mpsc::UnboundedSender<GossipMessage>,
     /// Received message count
@@ -28,20 +31,30 @@ pub struct GossipProtocol {
 }
 
 impl GossipProtocol {
-    /// Create a new gossip protocol handler
+    /// Create a new gossip protocol handler. The validator identity is
+    /// derived from the signing key's public key.
     pub fn new(
-        validator_id: [u8; 32],
+        signer: SigningKey,
         crds: Arc<Crds>,
         msg_sender: mpsc::UnboundedSender<GossipMessage>,
     ) -> Self {
+        let validator_id = signer.verifying_key().to_bytes();
         Self {
             crds,
             validator_id,
+            signer: Arc::new(signer),
             msg_sender,
             received_count: DashMap::new(),
             pending_pings: DashMap::new(),
             stats: parking_lot::RwLock::new(ProtocolStats::default()),
         }
+    }
+
+    /// Build a message with our identity and sign it with our key.
+    fn signed(&self, message_type: MessageType, payload: GossipPayload) -> GossipMessage {
+        let mut msg = GossipMessage::new(self.validator_id, message_type, payload);
+        msg.sign(&self.signer);
+        msg
     }
 
     /// Handle an incoming gossip message
@@ -111,8 +124,7 @@ impl GossipProtocol {
                 continue; // Don't send to ourselves or back to sender
             }
 
-            let forward =
-                GossipMessage::new(self.validator_id, MessageType::Push, msg.payload.clone());
+            let forward = self.signed(MessageType::Push, msg.payload.clone());
 
             if let Err(e) = self.msg_sender.send(forward) {
                 tracing::error!("Failed to forward push: {}", e);
@@ -140,8 +152,7 @@ impl GossipProtocol {
             }
 
             // Send pull response
-            let response = GossipMessage::new(
-                self.validator_id,
+            let response = self.signed(
                 MessageType::PullResponse,
                 GossipPayload::PullResponse(PullResponseData {
                     items,
@@ -194,8 +205,7 @@ impl GossipProtocol {
     async fn handle_ping(&self, msg: &GossipMessage) -> anyhow::Result<()> {
         if let GossipPayload::Ping(ping) = &msg.payload {
             // Respond with pong
-            let pong = GossipMessage::new(
-                self.validator_id,
+            let pong = self.signed(
                 MessageType::Pong,
                 GossipPayload::Pong(PongData { nonce: ping.nonce }),
             );
@@ -219,11 +229,7 @@ impl GossipProtocol {
         let nonce = rand::random::<u64>();
         self.pending_pings.insert(nonce, peer.pubkey);
 
-        let ping = GossipMessage::new(
-            self.validator_id,
-            MessageType::Ping,
-            GossipPayload::Ping(PingData { nonce }),
-        );
+        let ping = self.signed(MessageType::Ping, GossipPayload::Ping(PingData { nonce }));
 
         let _ = self.msg_sender.send(ping);
         Ok(())
@@ -235,8 +241,7 @@ impl GossipProtocol {
         _peer: ContactInfo,
         filters: Vec<(String, u64)>,
     ) -> anyhow::Result<()> {
-        let request = GossipMessage::new(
-            self.validator_id,
+        let request = self.signed(
             MessageType::PullRequest,
             GossipPayload::PullRequest(PullRequestData {
                 filters,
@@ -281,10 +286,14 @@ pub struct ProtocolStats {
 mod tests {
     use super::*;
 
-    fn test_validator() -> [u8; 32] {
-        let mut v = [0u8; 32];
-        v[0] = 1;
-        v
+    fn test_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    fn signed_incoming(message_type: MessageType, payload: GossipPayload) -> GossipMessage {
+        let mut msg = GossipMessage::new([0u8; 32], message_type, payload);
+        msg.sign(&test_key(2));
+        msg
     }
 
     #[tokio::test]
@@ -292,19 +301,21 @@ mod tests {
         let crds = Arc::new(Crds::default_store());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let protocol = GossipProtocol::new(test_validator(), crds, tx);
+        let protocol = GossipProtocol::new(test_key(1), crds, tx);
 
-        let ping_msg = GossipMessage::new(
-            [2u8; 32],
+        let ping_msg = signed_incoming(
             MessageType::Ping,
             GossipPayload::Ping(PingData { nonce: 42 }),
         );
 
         protocol.handle_message(ping_msg).await.unwrap();
 
-        // Should have sent a pong
+        // Should have sent a signed pong
         let pong = rx.recv().await.unwrap();
         assert_eq!(pong.message_type, MessageType::Pong);
+        assert!(pong.verify_signature());
+        assert_eq!(pong.from, protocol.validator_id);
+        assert_eq!(protocol.stats().invalid_messages, 0);
     }
 
     #[tokio::test]
@@ -312,7 +323,7 @@ mod tests {
         let crds = Arc::new(Crds::default_store());
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        let protocol = GossipProtocol::new(test_validator(), crds.clone(), tx);
+        let protocol = GossipProtocol::new(test_key(1), crds.clone(), tx);
 
         let push_data = PushData {
             id: [1u8; 32],
@@ -320,13 +331,47 @@ mod tests {
             kind: "vote".to_string(),
         };
 
-        let push_msg =
-            GossipMessage::new([2u8; 32], MessageType::Push, GossipPayload::Push(push_data));
+        let push_msg = signed_incoming(MessageType::Push, GossipPayload::Push(push_data));
 
         protocol.handle_message(push_msg).await.unwrap();
 
         // Should be in CRDS
         assert!(!crds.is_empty());
+        assert_eq!(protocol.stats().invalid_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn test_unsigned_message_rejected() {
+        let crds = Arc::new(Crds::default_store());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let protocol = GossipProtocol::new(test_key(1), crds, tx);
+
+        // Not signed at all — must be counted and dropped, no reply sent
+        let unsigned = GossipMessage::new(
+            [2u8; 32],
+            MessageType::Ping,
+            GossipPayload::Ping(PingData { nonce: 7 }),
+        );
+        assert!(!unsigned.verify_signature());
+
+        protocol.handle_message(unsigned).await.unwrap();
+        assert_eq!(protocol.stats().invalid_messages, 1);
+        assert!(rx.try_recv().is_err());
+
+        // Signed by the wrong key's message but with `from` overridden
+        let mut forged = GossipMessage::new(
+            [1u8; 32],
+            MessageType::Ping,
+            GossipPayload::Ping(PingData { nonce: 8 }),
+        );
+        forged.sign(&test_key(3));
+        forged.from = protocol.validator_id; // impersonate us after signing
+        assert!(!forged.verify_signature());
+
+        protocol.handle_message(forged).await.unwrap();
+        assert_eq!(protocol.stats().invalid_messages, 2);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -334,10 +379,9 @@ mod tests {
         let crds = Arc::new(Crds::default_store());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let protocol = GossipProtocol::new(test_validator(), crds, tx);
+        let protocol = GossipProtocol::new(test_key(1), crds, tx);
 
-        let pull_msg = GossipMessage::new(
-            [2u8; 32],
+        let pull_msg = signed_incoming(
             MessageType::PullRequest,
             GossipPayload::PullRequest(PullRequestData {
                 filters: vec![("vote".to_string(), 0)],
@@ -356,8 +400,10 @@ mod tests {
 
         protocol.handle_message(pull_msg).await.unwrap();
 
-        // Should have sent a pull response
+        // Should have sent a signed pull response
         let response = rx.recv().await.unwrap();
         assert_eq!(response.message_type, MessageType::PullResponse);
+        assert!(response.verify_signature());
+        assert_eq!(response.from, protocol.validator_id);
     }
 }

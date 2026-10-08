@@ -1,5 +1,6 @@
 //! Gossip message types for CRDS
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -162,37 +163,46 @@ impl GossipMessage {
         }
     }
 
-    /// Compute message hash for deduplication
+    /// Data covered by the Ed25519 signature: sender identity, message
+    /// type, timestamp and the full serialized payload (every variant —
+    /// nothing can be swapped or dropped without breaking the signature).
+    pub fn signable_data(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&self.from);
+        data.push(self.message_type as u8);
+        data.extend_from_slice(&self.timestamp.to_le_bytes());
+        let payload = serde_json::to_vec(&self.payload).expect("gossip payload always serializes");
+        data.extend_from_slice(&payload);
+        data
+    }
+
+    /// Compute message hash for deduplication — covers the exact same
+    /// bytes as the signature.
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        hasher.update(self.from);
-        hasher.update((self.message_type as u8).to_le_bytes());
-        hasher.update(self.timestamp.to_le_bytes());
-
-        match &self.payload {
-            GossipPayload::Push(data) => {
-                hasher.update(data.id);
-                hasher.update(&data.content);
-            }
-            GossipPayload::PullRequest(data) => {
-                for (kind, ts) in &data.filters {
-                    hasher.update(kind.as_bytes());
-                    hasher.update(ts.to_le_bytes());
-                }
-            }
-            _ => {}
-        }
-
+        hasher.update(self.signable_data());
         let result = hasher.finalize();
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&result);
         bytes
     }
 
-    /// Verify message signature (stub)
+    /// Sign this message with the sender's Ed25519 key. Rebinds `from` to
+    /// the key's public key.
+    pub fn sign(&mut self, key: &SigningKey) {
+        self.from = key.verifying_key().to_bytes();
+        self.signature = key.sign(&self.signable_data()).to_bytes().to_vec();
+    }
+
+    /// Verify the message's Ed25519 signature against its sender identity.
     pub fn verify_signature(&self) -> bool {
-        // In real implementation, verify Ed25519 signature
-        true
+        let Ok(vk) = VerifyingKey::from_bytes(&self.from) else {
+            return false;
+        };
+        let Ok(sig) = Signature::from_slice(&self.signature) else {
+            return false;
+        };
+        vk.verify_strict(&self.signable_data(), &sig).is_ok()
     }
 
     /// Get the data age in milliseconds
@@ -217,20 +227,79 @@ mod tests {
             kind: "vote".to_string(),
         };
 
-        let msg = GossipMessage::new([42u8; 32], MessageType::Push, GossipPayload::Push(push));
+        let mut msg = GossipMessage::new([42u8; 32], MessageType::Push, GossipPayload::Push(push));
+        msg.sign(&SigningKey::from_bytes(&[7u8; 32]));
 
         assert_eq!(msg.message_type, MessageType::Push);
         assert!(msg.verify_signature());
     }
 
     #[test]
+    fn test_unsigned_message_rejected() {
+        let msg = GossipMessage::new(
+            [1u8; 32],
+            MessageType::Ping,
+            GossipPayload::Ping(PingData { nonce: 1 }),
+        );
+        assert!(!msg.verify_signature());
+    }
+
+    #[test]
+    fn test_tampered_message_rejected() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mut msg = GossipMessage::new(
+            [1u8; 32],
+            MessageType::Push,
+            GossipPayload::Push(PushData {
+                id: [1u8; 32],
+                content: vec![1, 2, 3],
+                kind: "vote".to_string(),
+            }),
+        );
+        msg.sign(&sk);
+        assert!(msg.verify_signature());
+
+        // Swap the payload after signing
+        if let GossipPayload::Push(data) = &mut msg.payload {
+            data.content = vec![9, 9, 9];
+        }
+        assert!(!msg.verify_signature());
+
+        // Swap the sender after signing
+        msg.sign(&sk);
+        msg.from = [3u8; 32];
+        assert!(!msg.verify_signature());
+    }
+
+    #[test]
+    fn test_message_hash_covers_signature_bytes() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let mk = |nonce| GossipPayload::Ping(PingData { nonce });
+        let mut msg1 = GossipMessage::new([1u8; 32], MessageType::Ping, mk(1));
+        let mut msg2 = GossipMessage::new([1u8; 32], MessageType::Ping, mk(1));
+        msg1.sign(&sk);
+        msg2.sign(&sk);
+
+        // Same content, independently signed → same hash
+        assert_eq!(msg1.hash(), msg2.hash());
+
+        // Different nonce → different hash
+        let mut msg3 = GossipMessage::new([1u8; 32], MessageType::Ping, mk(2));
+        msg3.sign(&sk);
+        assert_ne!(msg1.hash(), msg3.hash());
+    }
+
+    #[test]
     fn test_message_hash_deterministic() {
         let payload = GossipPayload::Ping(PingData { nonce: 12345 });
-        let msg1 = GossipMessage::new([1u8; 32], MessageType::Ping, payload.clone());
-        let msg2 = GossipMessage::new([1u8; 32], MessageType::Ping, payload);
+        let mut msg1 = GossipMessage::new([1u8; 32], MessageType::Ping, payload.clone());
+        let mut msg2 = GossipMessage::new([1u8; 32], MessageType::Ping, payload);
+        msg2.timestamp = msg1.timestamp;
 
         // Same from, type, timestamp → same hash
         assert_eq!(msg1.hash(), msg2.hash());
+        msg1.timestamp += 1;
+        assert_ne!(msg1.hash(), msg2.hash());
     }
 
     #[test]

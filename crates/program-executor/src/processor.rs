@@ -46,11 +46,12 @@ impl InstructionProcessor {
         Self { accounts }
     }
 
-    /// Process a single instruction
+    /// Process a single instruction against the transaction's account keys
     pub fn process_instruction(
         &self,
         instruction: &Instruction,
         signer: &Pubkey,
+        account_keys: &[Pubkey],
     ) -> InstructionResult {
         let mut budget = ComputeBudget::new(DEFAULT_COMPUTE_UNITS);
         let mut logs = Vec::new();
@@ -70,6 +71,7 @@ impl InstructionProcessor {
                     &instruction.data,
                     &instruction.account_metas,
                     signer,
+                    account_keys,
                     &self.accounts,
                     &mut budget,
                     &mut logs,
@@ -83,22 +85,23 @@ impl InstructionProcessor {
                     &instruction.data,
                     &instruction.account_metas,
                     signer,
+                    account_keys,
                     &self.accounts,
                     &mut budget,
                     &mut logs,
                 )
             }
-            // Unknown program — check if it's a loaded program
+            // Unknown program — must be deployed & executable
             _ => {
                 match self.accounts.load(&instruction.program_id) {
                     Some(account) if account.executable => {
                         budget.consume(500).unwrap_or(());
-                        logs.push(format!(
-                            "Invoking custom program {}",
-                            hex::encode(&instruction.program_id[..8])
-                        ));
-                        // Custom program execution (stub)
-                        Ok(())
+                        // No SBF runtime is linked in this build: a deployed
+                        // program account is detected, but its bytecode cannot
+                        // be executed. Fail honestly instead of pretending.
+                        Err(crate::InstructionError::ProgramError(
+                            "program is deployed but no SBF runtime is linked".to_string(),
+                        ))
                     }
                     Some(_) => Err(InstructionError::InvalidAccountOwner),
                     None => Err(InstructionError::AccountNotFound),
@@ -157,7 +160,7 @@ mod tests {
             data: SystemInstruction::Transfer { lamports: 100 }.to_data(),
         };
 
-        let result = processor.process_instruction(&ix, &signer);
+        let result = processor.process_instruction(&ix, &signer, &[]);
         // Transfer fails because only 0 account_metas, but the dispatch succeeded
         // (we didn't hit InvalidAccountOwner or AccountNotFound)
         assert!(!result.success); // expected: InvalidInstructionData for missing accounts
@@ -175,8 +178,31 @@ mod tests {
             data: vec![],
         };
 
-        let result = processor.process_instruction(&ix, &signer);
+        let result = processor.process_instruction(&ix, &signer, &[]);
         assert!(!result.success);
+    }
+
+    #[test]
+    fn test_deployed_program_without_runtime_fails_honestly() {
+        let processor = test_processor();
+        let signer = [42u8; 32];
+
+        // A program account that is marked executable, but no SBF runtime
+        // exists — must fail, never fake success.
+        let mut prog = Account::new_system_account([77u8; 32], 0);
+        prog.executable = true;
+        processor.accounts().store([77u8; 32], &prog);
+
+        let ix = Instruction {
+            program_id: [77u8; 32],
+            account_metas: vec![],
+            data: vec![],
+        };
+
+        let result = processor.process_instruction(&ix, &signer, &[]);
+        assert!(!result.success);
+        let err = result.error.expect("must carry an error");
+        assert!(matches!(err, InstructionError::ProgramError(_)));
     }
 
     #[test]

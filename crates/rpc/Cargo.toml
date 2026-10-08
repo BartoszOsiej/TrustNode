@@ -15,3 +15,7 @@ tracing = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+solana-program-executor = { path = "../program-executor" }

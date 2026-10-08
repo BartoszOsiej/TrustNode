@@ -7,8 +7,9 @@ use crate::scheduler::ExecutionBatch;
 use crate::transaction::{Transaction, TransactionError, TransactionResult};
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use solana_accounts::account::Account;
 use solana_accounts::store::AccountsDB;
+use solana_program_executor::instruction::AccountMeta as ProgramAccountMeta;
+use solana_program_executor::{Instruction as ProgramInstruction, InstructionProcessor};
 use std::sync::Arc;
 
 /// Execution context for a single transaction
@@ -51,6 +52,8 @@ impl ExecutionContext {
 pub struct Executor {
     /// Reference to the accounts database
     db: Arc<AccountsDB>,
+    /// Native program dispatcher (system, token, deployed programs)
+    processor: InstructionProcessor,
     /// Lock table for concurrent access
     /// Maps account index -> whether it's currently locked for writing
     #[allow(dead_code)]
@@ -68,6 +71,7 @@ impl Executor {
     /// Create a new executor
     pub fn new(db: Arc<AccountsDB>) -> Self {
         Self {
+            processor: InstructionProcessor::new(db.clone()),
             db,
             write_locks: DashMap::new(),
             read_locks: DashMap::new(),
@@ -118,77 +122,82 @@ impl Executor {
         TransactionResult::success(ctx.compute_units, tx.fee)
     }
 
-    /// Execute fee payment (deduct lamports from signer)
+    /// Charge the transaction fee — deducted from the signer's account
+    /// before any instruction runs (the fee is paid even if an instruction
+    /// later fails, like on Solana).
     fn execute_fee_payment(
         &self,
         tx: &Transaction,
         ctx: &mut ExecutionContext,
     ) -> Result<(), TransactionError> {
         ctx.consume_compute(150)?; // Fee processing cost
+
+        let mut account =
+            self.db
+                .load(&tx.signer)
+                .ok_or(TransactionError::InsufficientLamports {
+                    needed: tx.fee,
+                    available: 0,
+                })?;
+        if account.lamports < tx.fee {
+            return Err(TransactionError::InsufficientLamports {
+                needed: tx.fee,
+                available: account.lamports,
+            });
+        }
+        account.lamports -= tx.fee;
+        self.db.store(tx.signer, &account);
+
         ctx.log(format!("Fee paid: {} lamports", tx.fee));
         Ok(())
     }
 
-    /// Execute a single instruction
+    /// Execute a single instruction through the native program dispatcher
     fn execute_instruction(
         &self,
         tx: &Transaction,
         ix: &crate::transaction::Instruction,
         ctx: &mut ExecutionContext,
     ) -> Result<(), TransactionError> {
-        ctx.consume_compute(100)?; // Base instruction cost
         ctx.log(format!("Executing program: {:?}", ix.program_id));
 
-        // Check if program exists and is executable
-        if let Some(program) = self.db.load(&ix.program_id) {
-            if !program.executable {
-                return Err(TransactionError::ProgramError(
-                    "Account is not a program".to_string(),
-                ));
-            }
-        }
-        // Note: system program (all 1s) is special-cased
-
-        // In a real implementation, this would dispatch to a VM (SBF/EBPF)
-        // For now, we simulate basic program execution
-        match &ix.program_id {
-            // System program
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] =>
-            {
-                self.execute_system_program(tx, ix, ctx)?;
-            }
-            // Token program
-            [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] =>
-            {
-                ctx.log("Token program invoked (stub)".to_string());
-            }
-            // Unknown program — simulate success
-            _ => {
-                ctx.consume_compute(500)?; // Generic program cost
-                ctx.log(format!("Custom program executed: {:?}", ix.program_id));
+        // Single-signer model: every meta flagged as a signer must resolve to
+        // the transaction's Ed25519-verified signer key.
+        for meta in &ix.accounts {
+            if meta.is_signer {
+                match tx.account_keys.get(meta.index as usize) {
+                    Some(key) if *key == tx.signer => {}
+                    _ => return Err(TransactionError::InvalidSignature),
+                }
             }
         }
 
-        Ok(())
-    }
+        let program_ix = ProgramInstruction {
+            program_id: ix.program_id,
+            account_metas: ix
+                .accounts
+                .iter()
+                .map(|m| ProgramAccountMeta::new(m.index as usize, m.is_signer, m.is_writable))
+                .collect(),
+            data: ix.data.clone(),
+        };
 
-    /// Simulate system program operations
-    fn execute_system_program(
-        &self,
-        tx: &Transaction,
-        _ix: &crate::transaction::Instruction,
-        ctx: &mut ExecutionContext,
-    ) -> Result<(), TransactionError> {
-        // Check that signer account exists
-        if !self.db.exists(&tx.signer) {
-            // Create the signer account if it doesn't exist
-            let acc = Account::new_system_account(tx.signer, 0);
-            self.db.store(tx.signer, &acc);
-            ctx.log(format!("Created account: {:?}", tx.signer));
+        let result = self
+            .processor
+            .process_instruction(&program_ix, &tx.signer, &tx.account_keys);
+
+        for log in &result.logs {
+            ctx.log(log.clone());
         }
+        ctx.consume_compute(result.compute_units_consumed)?;
 
-        ctx.consume_compute(150)?;
-        ctx.log("System program: processed".to_string());
+        if !result.success {
+            let msg = result
+                .error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "program failed".to_string());
+            return Err(TransactionError::ProgramError(msg));
+        }
 
         Ok(())
     }
@@ -232,22 +241,40 @@ pub struct ExecutorStats {
 mod tests {
     use super::*;
     use crate::transaction::{AccountMeta, Instruction};
-    use solana_accounts::account::Pubkey;
+    use ed25519_dalek::SigningKey;
+    use solana_accounts::account::{Account, Pubkey};
+    use solana_program_executor::instruction::SystemInstruction;
 
     fn test_db() -> Arc<AccountsDB> {
         Arc::new(AccountsDB::new())
     }
 
-    fn test_signer() -> Pubkey {
-        let mut key = [0u8; 32];
-        key[0] = 42;
-        key
+    fn test_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
     }
 
-    fn test_program() -> Pubkey {
-        let mut key = [0u8; 32];
-        key[0] = 1;
-        key
+    fn transfer_tx(sk: &SigningKey, recipient: Pubkey, lamports: u64) -> Transaction {
+        let signer = sk.verifying_key().to_bytes();
+        let ix = Instruction {
+            program_id: [1u8; 32], // native system program
+            accounts: vec![
+                AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    index: 1,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            data: SystemInstruction::Transfer { lamports }.to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.account_keys.push(recipient);
+        tx.sign(sk);
+        tx
     }
 
     #[test]
@@ -255,28 +282,106 @@ mod tests {
         let db = test_db();
         let executor = Executor::new(db.clone());
 
-        let signer = test_signer();
+        let sk = test_key(42);
+        let signer = sk.verifying_key().to_bytes();
+        let recipient = [7u8; 32];
 
-        // Create signer account with lamports
-        let signer_acc = Account::new_system_account(signer, 10_000_000);
-        db.store(signer, &signer_acc);
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        let tx = transfer_tx(&sk, recipient, 500);
+        let result = executor.execute_transaction(&tx);
+
+        assert!(result.success, "should succeed: {:?}", result.error);
+        assert!(result.compute_units_consumed > 0);
+
+        // Fee + transfer actually moved lamports (no simulated balances)
+        assert_eq!(db.load(&signer).unwrap().lamports, 10_000_000 - 5_000 - 500);
+        assert_eq!(db.load(&recipient).unwrap().lamports, 500);
+    }
+
+    #[test]
+    fn test_unsigned_transaction_rejected() {
+        let db = test_db();
+        let executor = Executor::new(db.clone());
+
+        let sk = test_key(42);
+        let signer = sk.verifying_key().to_bytes();
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        let mut tx = transfer_tx(&sk, [7u8; 32], 500);
+        tx.signature = vec![]; // strip the signature
+
+        let result = executor.execute_transaction(&tx);
+        assert!(!result.success);
+        assert!(matches!(
+            result.error,
+            Some(TransactionError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn test_signer_flag_must_match_signed_key() {
+        let db = test_db();
+        let executor = Executor::new(db.clone());
+
+        let sk = test_key(42);
+        let signer = sk.verifying_key().to_bytes();
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        // Index 1 is flagged as a signer, but its key is not the tx signer
+        let ix = Instruction {
+            program_id: [1u8; 32],
+            accounts: vec![
+                AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    index: 1,
+                    is_signer: true,
+                    is_writable: true,
+                },
+            ],
+            data: SystemInstruction::Transfer { lamports: 500 }.to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.account_keys.push([7u8; 32]);
+        tx.sign(&sk);
+
+        let result = executor.execute_transaction(&tx);
+        assert!(!result.success);
+        assert!(matches!(
+            result.error,
+            Some(TransactionError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn test_unknown_program_is_rejected() {
+        let db = test_db();
+        let executor = Executor::new(db.clone());
+
+        let sk = test_key(42);
+        let signer = sk.verifying_key().to_bytes();
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
 
         let ix = Instruction {
-            program_id: test_program(),
+            program_id: [99u8; 32], // never deployed
             accounts: vec![AccountMeta {
                 index: 0,
                 is_signer: true,
-                is_writable: true,
+                is_writable: false,
             }],
-            data: b"transfer".to_vec(),
+            data: vec![],
         };
-
         let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
-        tx.signature = vec![1u8; 64]; // Dummy signature
+        tx.sign(&sk);
 
         let result = executor.execute_transaction(&tx);
-        assert!(result.success, "Transaction should succeed");
-        assert!(result.compute_units_consumed > 0);
+        assert!(!result.success);
+        let msg = result.error.map(|e| e.to_string()).unwrap_or_default();
+        assert!(msg.contains("not found"), "unexpected error: {msg}");
     }
 
     #[test]
@@ -284,7 +389,8 @@ mod tests {
         let db = test_db();
         let executor = Executor::new(db);
 
-        let signer = test_signer();
+        let sk = test_key(42);
+        let signer = sk.verifying_key().to_bytes();
         let tx = Transaction::new(signer, vec![], [0u8; 32]); // Empty instructions
 
         let result = executor.execute_transaction(&tx);
@@ -296,25 +402,12 @@ mod tests {
         let db = test_db();
         let executor = Executor::new(db.clone());
 
-        let signer = test_signer();
-        let signer_acc = Account::new_system_account(signer, 10_000_000);
-        db.store(signer, &signer_acc);
+        let sk = test_key(43);
+        let signer = sk.verifying_key().to_bytes();
+        let recipient = [8u8; 32];
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
 
-        let mut txs = Vec::new();
-        for _ in 0..3 {
-            let ix = Instruction {
-                program_id: test_program(),
-                accounts: vec![AccountMeta {
-                    index: 0,
-                    is_signer: true,
-                    is_writable: true,
-                }],
-                data: vec![],
-            };
-            let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
-            tx.signature = vec![1u8; 64];
-            txs.push(tx);
-        }
+        let txs: Vec<Transaction> = (0..3).map(|_| transfer_tx(&sk, recipient, 100)).collect();
 
         let batch = ExecutionBatch {
             index: 0,
@@ -325,5 +418,12 @@ mod tests {
         let results = executor.execute_batch(&batch);
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| r.success));
+
+        // 3 fees + 3 transfers deducted for real
+        assert_eq!(
+            db.load(&signer).unwrap().lamports,
+            10_000_000 - 3 * 5_000 - 3 * 100
+        );
+        assert_eq!(db.load(&recipient).unwrap().lamports, 300);
     }
 }
