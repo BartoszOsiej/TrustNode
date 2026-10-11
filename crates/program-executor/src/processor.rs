@@ -66,7 +66,9 @@ impl InstructionProcessor {
             // System program — [1u8; 32]
             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] =>
             {
-                budget.consume(150).unwrap_or(());
+                if let Err(e) = budget.consume(150) {
+                    return InstructionResult::with_logs(false, budget.consumed, Some(e), logs);
+                }
                 system_program::process_instruction(
                     &instruction.data,
                     &instruction.account_metas,
@@ -80,7 +82,9 @@ impl InstructionProcessor {
             // Token program — [2u8; 32]
             [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] =>
             {
-                budget.consume(150).unwrap_or(());
+                if let Err(e) = budget.consume(150) {
+                    return InstructionResult::with_logs(false, budget.consumed, Some(e), logs);
+                }
                 token_program::process_instruction(
                     &instruction.data,
                     &instruction.account_metas,
@@ -95,7 +99,14 @@ impl InstructionProcessor {
             _ => {
                 match self.accounts.load(&instruction.program_id) {
                     Some(account) if account.executable => {
-                        budget.consume(500).unwrap_or(());
+                        if let Err(e) = budget.consume(500) {
+                            return InstructionResult::with_logs(
+                                false,
+                                budget.consumed,
+                                Some(e),
+                                logs,
+                            );
+                        }
                         // No SBF runtime is linked in this build: a deployed
                         // program account is detected, but its bytecode cannot
                         // be executed. Fail honestly instead of pretending.
@@ -115,12 +126,11 @@ impl InstructionProcessor {
                     "Program success ({} compute units)",
                     budget.consumed
                 ));
-                InstructionResult::success(budget.consumed)
-                    .with_log("Program completed successfully".to_string())
+                InstructionResult::with_logs(true, budget.consumed, None, logs)
             }
             Err(e) => {
                 logs.push(format!("Program failed: {}", e));
-                InstructionResult::failure(e, budget.consumed)
+                InstructionResult::with_logs(false, budget.consumed, Some(e), logs)
             }
         }
     }

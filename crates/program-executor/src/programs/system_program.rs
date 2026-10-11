@@ -6,14 +6,18 @@
 //! - Account assignment to programs
 //! - Nonce operations
 
-use crate::instruction::{resolve_account_key, AccountMeta, SystemInstruction};
+use crate::instruction::{require_signer, resolve_account_key, AccountMeta, SystemInstruction};
 use crate::processor::ComputeBudget;
 use crate::InstructionError;
 use solana_accounts::account::{Account, AccountData, Pubkey};
 use solana_accounts::store::AccountsDB;
 
-/// Minimum rent-exempt balance for an account
-pub const MINIMUM_RENT_EXEMPT_BALANCE: u64 = 890_880; // ~0.00089 SOL
+pub use solana_accounts::account::MINIMUM_RENT_EXEMPT_BALANCE;
+
+/// Maximum data size for a single account. `space` comes straight off the
+/// wire, so without this bound a single transaction could ask the node to
+/// allocate an arbitrary number of bytes.
+pub const MAX_PERMITTED_DATA_LENGTH: u64 = 10 * 1024 * 1024; // 10 MiB
 
 /// Process a system program instruction
 pub fn process_instruction(
@@ -91,13 +95,8 @@ fn process_transfer(
     let from_meta = &account_metas[0];
     let to_meta = &account_metas[1];
 
-    // Load source account
-    let from_pubkey = resolve_account_key(from_meta.index, account_keys)?;
-    if &from_pubkey != signer && !from_meta.is_signer {
-        return Err(InstructionError::ProgramError(
-            "Source account not signed".to_string(),
-        ));
-    }
+    // The source account must be the transaction's signer.
+    let from_pubkey = require_signer(from_meta, signer, account_keys)?;
 
     let mut from_account = accounts
         .load(&from_pubkey)
@@ -112,15 +111,20 @@ fn process_transfer(
 
     let to_pubkey = resolve_account_key(to_meta.index, account_keys)?;
 
-    // Deduct from source
-    from_account.lamports -= lamports;
-    accounts.store(from_pubkey, &from_account);
-
-    // Credit destination
+    // Credit with checked arithmetic — a release-mode u64 wrap in the credit
+    // path would mint lamports out of nothing.
     let mut to_account = accounts
         .load(&to_pubkey)
         .unwrap_or_else(|| Account::new_system_account(to_pubkey, 0));
-    to_account.lamports += lamports;
+    to_account.lamports = to_account
+        .lamports
+        .checked_add(lamports)
+        .ok_or(InstructionError::ArithmeticOverflow)?;
+
+    // Both sides are applied only after every check has passed, so a failure
+    // above cannot leave a half-completed transfer behind.
+    from_account.lamports -= lamports;
+    accounts.store(from_pubkey, &from_account);
     accounts.store(to_pubkey, &to_account);
 
     logs.push(format!(
@@ -157,14 +161,18 @@ fn process_create_account(
     let payer_meta = &account_metas[0];
     let new_account_meta = &account_metas[1];
 
-    let payer_pubkey = resolve_account_key(payer_meta.index, account_keys)?;
+    // The payer must be the transaction's signer.
+    let payer_pubkey = require_signer(payer_meta, signer, account_keys)?;
     let new_account_pubkey = resolve_account_key(new_account_meta.index, account_keys)?;
 
-    // Payer must be signer
-    if &payer_pubkey != signer && !payer_meta.is_signer {
-        return Err(InstructionError::ProgramError(
-            "Payer not signed".to_string(),
-        ));
+    // `space` is attacker-controlled and comes straight off the wire. Bound it
+    // before it reaches an allocation, or a single transaction can exhaust
+    // the node's memory.
+    if space > MAX_PERMITTED_DATA_LENGTH {
+        return Err(InstructionError::DataSizeTooLarge {
+            requested: space,
+            max: MAX_PERMITTED_DATA_LENGTH,
+        });
     }
 
     // New account must not exist
@@ -179,21 +187,27 @@ fn process_create_account(
         .load(&payer_pubkey)
         .ok_or(InstructionError::AccountNotFound)?;
 
-    let total_cost = lamports + MINIMUM_RENT_EXEMPT_BALANCE;
-    if payer.lamports < total_cost {
+    // The payer funds `lamports` *plus* the rent-exempt reserve. Both end up
+    // on the new account — crediting only `lamports` used to destroy the rent
+    // reserve from the total supply on every CreateAccount.
+    let new_lamports = lamports
+        .checked_add(MINIMUM_RENT_EXEMPT_BALANCE)
+        .ok_or(InstructionError::ArithmeticOverflow)?;
+
+    if payer.lamports < new_lamports {
         return Err(InstructionError::InsufficientFunds {
-            needed: total_cost,
+            needed: new_lamports,
             available: payer.lamports,
         });
     }
 
     // Deduct from payer
-    payer.lamports -= total_cost;
+    payer.lamports -= new_lamports;
     accounts.store(payer_pubkey, &payer);
 
     // Create new account
     let new_account = Account {
-        lamports,
+        lamports: new_lamports,
         owner,
         executable: false,
         rent_epoch: 0,
@@ -230,14 +244,7 @@ fn process_assign(
         ));
     }
 
-    let account_pubkey = resolve_account_key(account_metas[0].index, account_keys)?;
-
-    // Must be signer
-    if &account_pubkey != signer && !account_metas[0].is_signer {
-        return Err(InstructionError::ProgramError(
-            "Account not signed".to_string(),
-        ));
-    }
+    let account_pubkey = require_signer(&account_metas[0], signer, account_keys)?;
 
     let mut account = accounts
         .load(&account_pubkey)
@@ -269,6 +276,14 @@ mod tests {
         // System program
         db.store([1u8; 32], &Account::new_system_account([1u8; 32], 0));
         db
+    }
+
+    /// Total lamports across every account — the supply invariant.
+    fn supply(db: &AccountsDB) -> u64 {
+        db.pubkeys()
+            .iter()
+            .filter_map(|k| db.load(k).map(|a| a.lamports))
+            .sum()
     }
 
     #[test]
@@ -408,7 +423,131 @@ mod tests {
         assert!(result.is_ok());
 
         let new_account = accounts.load(&new_key).unwrap();
-        assert_eq!(new_account.lamports, 1_000_000);
         assert_eq!(new_account.owner, [42u8; 32]);
+        assert_eq!(
+            new_account.lamports,
+            1_000_000 + MINIMUM_RENT_EXEMPT_BALANCE
+        );
+    }
+
+    #[test]
+    fn test_create_account_never_destroys_lamports() {
+        let accounts = test_accounts();
+        let mut budget = ComputeBudget::new(10_000);
+        let mut logs = Vec::new();
+
+        let payer_key = [10u8; 32];
+        let new_key = [11u8; 32];
+        let keys = [payer_key, new_key];
+        let payer_acc = Account::new_system_account(payer_key, 10_000_000);
+        accounts.store(payer_key, &payer_acc);
+
+        let metas = vec![
+            AccountMeta::new(0, true, true),
+            AccountMeta::new(1, false, true),
+        ];
+
+        let supply_before = supply(&accounts);
+
+        process_instruction(
+            &SystemInstruction::CreateAccount {
+                lamports: 1_000_000,
+                space: 1024,
+                owner: [42u8; 32],
+            }
+            .to_data(),
+            &metas,
+            &payer_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        )
+        .unwrap();
+
+        // Creating an account moves lamports, it never mints or burns them.
+        assert_eq!(supply(&accounts), supply_before);
+    }
+
+    #[test]
+    fn test_create_account_rejects_oversized_data() {
+        let accounts = test_accounts();
+        let mut budget = ComputeBudget::new(10_000);
+        let mut logs = Vec::new();
+
+        let payer_key = [10u8; 32];
+        let new_key = [11u8; 32];
+        let keys = [payer_key, new_key];
+        let payer_acc = Account::new_system_account(payer_key, u64::MAX);
+        accounts.store(payer_key, &payer_acc);
+
+        let metas = vec![
+            AccountMeta::new(0, true, true),
+            AccountMeta::new(1, false, true),
+        ];
+
+        // An attacker-controlled `space` must be rejected before allocation,
+        // even when the payer can obviously afford it.
+        let err = process_instruction(
+            &SystemInstruction::CreateAccount {
+                lamports: 1,
+                space: u64::MAX,
+                owner: [42u8; 32],
+            }
+            .to_data(),
+            &metas,
+            &payer_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, InstructionError::DataSizeTooLarge { .. }));
+        assert!(!accounts.exists(&new_key));
+    }
+
+    #[test]
+    fn test_transfer_by_non_signer_is_rejected() {
+        let accounts = test_accounts();
+        let mut budget = ComputeBudget::new(10_000);
+        let mut logs = Vec::new();
+
+        let victim_key = [10u8; 32];
+        let attacker_key = [12u8; 32];
+        let to_key = [11u8; 32];
+        let keys = [victim_key, attacker_key, to_key];
+
+        accounts.store(
+            victim_key,
+            &Account::new_system_account(victim_key, 1_000_000),
+        );
+        accounts.store(
+            attacker_key,
+            &Account::new_system_account(attacker_key, 1_000_000),
+        );
+
+        let metas = vec![
+            // Source meta claims is_signer, but resolves to the victim while
+            // the transaction's actual signer is the attacker.
+            AccountMeta::new(0, true, true),
+            AccountMeta::new(2, false, true),
+        ];
+
+        let err = process_instruction(
+            &SystemInstruction::Transfer { lamports: 500 }.to_data(),
+            &metas,
+            &attacker_key,
+            &keys,
+            &accounts,
+            &mut budget,
+            &mut logs,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, InstructionError::IncorrectAuthority));
+        assert_eq!(accounts.load(&victim_key).unwrap().lamports, 1_000_000);
+        assert_eq!(accounts.load(&to_key).map(|a| a.lamports), None);
     }
 }

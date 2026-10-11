@@ -71,6 +71,25 @@ pub fn resolve_account_key(
         .ok_or(crate::InstructionError::AccountNotFound)
 }
 
+/// Require that an account meta resolves to the transaction's signer.
+///
+/// The previous check was `resolved != signer && !meta.is_signer` — an AND of
+/// two negations, so a meta flagged `is_signer` that resolved to a *different*
+/// key sailed through. The `is_signer` flag is a claim made by the transaction;
+/// the binding to the actually-verified signer is the claim that matters, so
+/// that is the only thing enforced here.
+pub fn require_signer(
+    meta: &AccountMeta,
+    signer: &Pubkey,
+    account_keys: &[Pubkey],
+) -> Result<Pubkey, crate::InstructionError> {
+    let key = resolve_account_key(meta.index, account_keys)?;
+    if &key != signer {
+        return Err(crate::InstructionError::IncorrectAuthority);
+    }
+    Ok(key)
+}
+
 /// Result of executing an instruction
 #[derive(Debug, Clone)]
 pub struct InstructionResult {
@@ -87,6 +106,25 @@ pub struct InstructionResult {
 }
 
 impl InstructionResult {
+    /// Build a result carrying the full program log. The previous
+    /// `success`/`failure` constructors hardcoded `logs: vec![]`, which meant
+    /// every `logs.push` inside a program was discarded at this boundary and
+    /// clients never saw a single log line.
+    pub fn with_logs(
+        success: bool,
+        compute_units: u64,
+        error: Option<crate::InstructionError>,
+        logs: Vec<String>,
+    ) -> Self {
+        Self {
+            success,
+            compute_units_consumed: compute_units,
+            return_data: None,
+            error,
+            logs,
+        }
+    }
+
     pub fn success(compute_units: u64) -> Self {
         Self {
             success: true,
@@ -161,9 +199,9 @@ impl SystemInstruction {
             }
             // CreateAccount instruction (system program instruction 0)
             0 => {
-                if data.len() < 33 {
+                if data.len() < 49 {
                     return Err(crate::InstructionError::InvalidInstructionData(
-                        "CreateAccount requires 32 bytes".to_string(),
+                        "CreateAccount requires 49 bytes".to_string(),
                     ));
                 }
                 let lamports = u64::from_le_bytes(data[1..9].try_into().unwrap());
@@ -187,6 +225,8 @@ impl SystemInstruction {
                 owner.copy_from_slice(&data[1..33]);
                 Ok(Self::Assign { owner })
             }
+            // NonceInitialize instruction (system program instruction 7)
+            7 => Ok(Self::NonceInitialize),
             other => Err(crate::InstructionError::InvalidInstructionData(format!(
                 "Unknown system instruction: {}",
                 other
@@ -226,8 +266,12 @@ impl SystemInstruction {
 /// Token program instructions (simplified SPL Token)
 #[derive(Debug, Clone)]
 pub enum TokenInstruction {
-    /// Initialize a token account
-    InitializeAccount,
+    /// Create a new mint account. Account 0 (signer) becomes the mint
+    /// authority. One-time, mint must not already exist.
+    InitializeMint,
+    /// Create a token account holding `mint`.
+    /// Accounts: [0] = mint, [1] = new token account, [2] = owner (signer).
+    InitializeAccount { mint: Pubkey },
     /// Transfer tokens
     Transfer { amount: u64 },
     /// Mint tokens
@@ -245,7 +289,17 @@ impl TokenInstruction {
         }
 
         match data[0] {
-            0 => Ok(Self::InitializeAccount),
+            0 => {
+                if data.len() < 33 {
+                    return Err(crate::InstructionError::InvalidInstructionData(
+                        "InitializeAccount requires 32-byte mint".to_string(),
+                    ));
+                }
+                let mut mint = [0u8; 32];
+                mint.copy_from_slice(&data[1..33]);
+                Ok(Self::InitializeAccount { mint })
+            }
+            1 => Ok(Self::InitializeMint),
             3 => {
                 if data.len() < 9 {
                     return Err(crate::InstructionError::InvalidInstructionData(
@@ -283,7 +337,12 @@ impl TokenInstruction {
     /// Serialize to instruction data
     pub fn to_data(&self) -> Vec<u8> {
         match self {
-            Self::InitializeAccount => vec![0u8],
+            Self::InitializeMint => vec![1u8],
+            Self::InitializeAccount { mint } => {
+                let mut data = vec![0u8];
+                data.extend_from_slice(mint);
+                data
+            }
             Self::Transfer { amount } => {
                 let mut data = vec![3u8];
                 data.extend_from_slice(&amount.to_le_bytes());
@@ -370,5 +429,85 @@ mod tests {
         let r = AccountMeta::readonly(1);
         assert!(!r.is_signer);
         assert!(!r.is_writable);
+    }
+
+    #[test]
+    fn test_truncated_create_account_is_an_error_not_a_panic() {
+        // Regression: `from_data` checked `len() < 33` and then read
+        // `data[17..49]`, so any payload of 33..48 bytes — trivially
+        // reachable over RPC — panicked the node with a slice-index panic.
+        for len in 1..49usize {
+            let mut data = vec![0u8; len];
+            data[0] = 0; // CreateAccount
+            let result = SystemInstruction::from_data(&data);
+            assert!(result.is_err(), "payload of {} bytes must not parse", len);
+        }
+    }
+
+    #[test]
+    fn test_truncated_assign_is_an_error_not_a_panic() {
+        for len in 1..33usize {
+            let mut data = vec![0u8; len];
+            data[0] = 1; // Assign
+            assert!(SystemInstruction::from_data(&data).is_err());
+        }
+    }
+
+    #[test]
+    fn test_truncated_token_initialize_account_is_an_error_not_a_panic() {
+        for len in 1..33usize {
+            let mut data = vec![0u8; len];
+            data[0] = 0; // InitializeAccount
+            assert!(TokenInstruction::from_data(&data).is_err());
+        }
+    }
+
+    #[test]
+    fn test_nonce_initialize_roundtrip() {
+        // `to_data` emitted `vec![7]` but `from_data` had no arm for 7, so the
+        // round trip always failed.
+        let data = SystemInstruction::NonceInitialize.to_data();
+        assert_eq!(
+            data,
+            vec![7u8],
+            "durable nonces are advertised but not implemented"
+        );
+        match SystemInstruction::from_data(&data) {
+            Ok(SystemInstruction::NonceInitialize) => {}
+            other => panic!("expected NonceInitialize, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_token_initialize_account_roundtrip() {
+        let mint = [77u8; 32];
+        let data = TokenInstruction::InitializeAccount { mint }.to_data();
+        match TokenInstruction::from_data(&data).unwrap() {
+            TokenInstruction::InitializeAccount { mint: m } => assert_eq!(m, mint),
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_token_initialize_mint_roundtrip() {
+        let data = TokenInstruction::InitializeMint.to_data();
+        match TokenInstruction::from_data(&data).unwrap() {
+            TokenInstruction::InitializeMint => {}
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_require_signer_rejects_mismatched_key() {
+        let keys = [[1u8; 32], [2u8; 32]];
+        let meta = AccountMeta::new(0, true, true);
+
+        assert_eq!(require_signer(&meta, &[1u8; 32], &keys).unwrap(), [1u8; 32]);
+        // The `is_signer` flag is a claim by the transaction; a meta that
+        // resolves to a different key must never be accepted.
+        assert!(matches!(
+            require_signer(&meta, &[2u8; 32], &keys),
+            Err(crate::InstructionError::IncorrectAuthority)
+        ));
     }
 }

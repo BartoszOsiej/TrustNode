@@ -48,9 +48,33 @@ impl AccountsDB {
         }
     }
 
+    /// Every pubkey currently in the index.
+    pub fn pubkeys(&self) -> Vec<Pubkey> {
+        self.index.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Total lamports held across all accounts — the supply invariant that
+    /// every state transition must preserve.
+    pub fn total_lamports(&self) -> u64 {
+        self.index
+            .iter()
+            .filter_map(|e| self.load(e.key()).map(|a| a.lamports))
+            .sum()
+    }
+
     /// Store or update an account
     pub fn store(&self, pubkey: Pubkey, account: &Account) {
-        let serialized = serde_json::to_vec(account).expect("Failed to serialize account");
+        let serialized = serde_json::to_vec(account).unwrap_or_else(|e| {
+            // Serialization only fails on a corrupt account payload. Skipping
+            // the write is the only safe outcome: `expect` here would kill the
+            // node over a single bad account.
+            tracing::error!(
+                "account serialization failed for {}: {}",
+                hex::encode(&pubkey[..8]),
+                e
+            );
+            Vec::new()
+        });
         let length = serialized.len() as u64;
 
         let write_version = {

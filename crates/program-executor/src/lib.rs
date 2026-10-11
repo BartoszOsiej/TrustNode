@@ -48,6 +48,14 @@ pub enum InstructionError {
     ProgramError(String),
     /// Invalid account owner
     InvalidAccountOwner,
+    /// The transaction signer is not the authority required by the account
+    /// (token account authority, or mint authority).
+    IncorrectAuthority,
+    /// The supplied account is a mint when a token account is required,
+    /// or its mint does not match the transfer's mint.
+    MintMismatch,
+    /// Requested allocation exceeds the per-account data size limit.
+    DataSizeTooLarge { requested: u64, max: u64 },
     /// Arithmetic overflow
     ArithmeticOverflow,
     /// Custom error
@@ -66,6 +74,13 @@ impl std::fmt::Display for InstructionError {
             }
             Self::ProgramError(msg) => write!(f, "Program error: {}", msg),
             Self::InvalidAccountOwner => write!(f, "Invalid account owner"),
+            Self::IncorrectAuthority => {
+                write!(f, "Incorrect authority: signer may not perform this action")
+            }
+            Self::MintMismatch => write!(f, "Mint mismatch"),
+            Self::DataSizeTooLarge { requested, max } => {
+                write!(f, "Data size {} exceeds maximum {}", requested, max)
+            }
             Self::ArithmeticOverflow => write!(f, "Arithmetic overflow"),
             Self::Custom(code, msg) => write!(f, "Custom error {}: {}", code, msg),
         }

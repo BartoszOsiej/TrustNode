@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 /// Account public key (32 bytes, like Ed25519)
 pub type Pubkey = [u8; 32];
 
+/// Minimum rent-exempt balance (lamports a new account must hold so it
+/// cannot be garbage-collected). Mirrors the Solana rent constant.
+pub const MINIMUM_RENT_EXEMPT_BALANCE: u64 = 890_880;
+
 /// Account state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
@@ -34,6 +38,10 @@ pub enum AccountData {
         authority: Pubkey,
         amount: u64,
     },
+    /// Mint account — owns the supply of one token type. Only the mint
+    /// authority may create new units; only the token account's authority
+    /// may destroy them.
+    Mint { authority: Pubkey, supply: u64 },
     /// Generic data account
     Data(Vec<u8>),
 }
@@ -81,6 +89,21 @@ impl Account {
         }
     }
 
+    /// Create a mint account. `authority` is the only key allowed to mint
+    /// new units of this token.
+    pub fn new_mint(_pubkey: Pubkey, authority: Pubkey) -> Self {
+        Self {
+            lamports: MINIMUM_RENT_EXEMPT_BALANCE,
+            owner: token_program_id(),
+            executable: false,
+            rent_epoch: 0,
+            data: AccountData::Mint {
+                authority,
+                supply: 0,
+            },
+        }
+    }
+
     /// Compute hash of this account (for Merkle tree)
     pub fn hash(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -105,6 +128,11 @@ impl Account {
                 hasher.update(authority);
                 hasher.update(amount.to_le_bytes());
             }
+            AccountData::Mint { authority, supply } => {
+                hasher.update(b"mint");
+                hasher.update(authority);
+                hasher.update(supply.to_le_bytes());
+            }
             AccountData::Data(data) => {
                 hasher.update(b"data");
                 hasher.update(data);
@@ -127,6 +155,7 @@ impl Account {
                 AccountData::System => 0,
                 AccountData::Program(code) => code.len(),
                 AccountData::Token { .. } => 32 + 32 + 8,
+                AccountData::Mint { .. } => 32 + 8,
                 AccountData::Data(d) => d.len(),
             }
     }
