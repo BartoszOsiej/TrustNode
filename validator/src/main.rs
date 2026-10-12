@@ -20,16 +20,19 @@ use solana_blockstore::Blockstore;
 use solana_consensus::leader::{LeaderSchedule, ValidatorStake as LeaderStake};
 use solana_consensus::tower::Tower;
 use solana_gossip::Crds;
+use solana_mempool::Mempool;
 use solana_poh::{PohHash, PohHasher};
 use solana_rpc::{RpcHandler, RpcServer};
 use solana_turbine::ErasureCoder;
 use solana_tx_processor::transaction::AccountMeta;
-use solana_tx_processor::{Executor, Instruction, Transaction};
+use solana_tx_processor::{Executor, Instruction, Scheduler, Transaction};
 
 /// PoH hashes injected per tick.
 const HASHES_PER_TICK: u64 = 6000;
 /// Ticks per slot. The validator ticks at ~400ms, i.e. one tick is one slot.
 const TICKS_PER_SLOT: u64 = 1;
+/// Maximum transactions packed into a single block.
+const MAX_TXS_PER_BLOCK: usize = 128;
 
 /// CLI arguments
 #[derive(Parser, Debug)]
@@ -83,6 +86,8 @@ struct ValidatorState {
     #[allow(dead_code)]
     /// Transaction executor
     executor: Arc<Executor>,
+    /// Pending transaction pool, drained by the block producer
+    mempool: Arc<Mempool>,
     /// Tower BFT consensus
     tower: Arc<Tower>,
     /// Leader schedule
@@ -104,6 +109,7 @@ impl ValidatorState {
         identity: [u8; 32],
         ledger_dir: &str,
         accounts: Arc<AccountsDB>,
+        mempool: Arc<Mempool>,
     ) -> anyhow::Result<Self> {
         let executor = Arc::new(Executor::new(accounts.clone()));
         let tower = Arc::new(Tower::new(0));
@@ -147,6 +153,7 @@ impl ValidatorState {
             poh,
             accounts,
             executor,
+            mempool,
             tower,
             leader_schedule,
             current_slot,
@@ -233,18 +240,27 @@ async fn main() -> anyhow::Result<()> {
     let accounts = Arc::new(AccountsDB::open(&accounts_dir)?);
     create_genesis_accounts(&accounts);
 
+    // The mempool is shared between the RPC ingress and the block producer:
+    // the RPC parks transactions here, the producer drains them into blocks.
+    let mempool = Arc::new(Mempool::default_pool());
+
     // Initialize state
     let state = Arc::new(parking_lot::RwLock::new(ValidatorState::new(
         identity,
         &args.ledger,
         accounts.clone(),
+        mempool.clone(),
     )?));
 
     // Initialize CRDS
     let _crds = Arc::new(Crds::default_store());
 
-    // Initialize RPC on the same accounts database
-    let rpc_handler = Arc::new(RpcHandler::new(accounts.clone(), identity));
+    // Initialize RPC on the same accounts database and mempool
+    let rpc_handler = Arc::new(RpcHandler::with_mempool(
+        accounts.clone(),
+        identity,
+        mempool.clone(),
+    ));
 
     // Start tasks
     let mut handles = Vec::new();
@@ -367,23 +383,50 @@ fn load_identity(spec: &str) -> anyhow::Result<ed25519_dalek::SigningKey> {
     Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
-/// Produce a new block
+/// Produce a new block: pack the highest-fee transactions out of the mempool,
+/// schedule them into non-conflicting Sealevel batches, execute those batches,
+/// commit the resulting accounts state root, and persist the block along with
+/// its transactions.
 async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
     let mut s = state.write();
 
-    // Get current hash
-    let block_hash = s.poh.current();
-    let poh_hash = *block_hash.as_bytes();
-
-    // Persist to the blockstore before acknowledging the block
+    let poh_hash = *s.poh.current().as_bytes();
     let slot = s.current_slot;
     let height = s.block_height;
-    match s.ledger.append(slot, height, 1, 0, poh_hash) {
+
+    // Pack the most valuable pending work first.
+    let transactions = s.mempool.drain(MAX_TXS_PER_BLOCK);
+    let tx_count = transactions.len();
+
+    // Group them into non-conflicting batches, then run each batch.
+    let mut scheduler = Scheduler::default_solana();
+    scheduler.enqueue_batch(transactions.clone());
+    scheduler.schedule();
+
+    let mut entry_count = 0u64;
+    let mut succeeded = 0u64;
+    while let Some(batch) = scheduler.next_batch() {
+        entry_count += 1;
+        let results = s.executor.execute_batch(&batch);
+        succeeded += results.iter().filter(|r| r.success).count() as u64;
+    }
+
+    // The state root commits to the effect this block had on accounts.
+    let state_root = *s.accounts.compute_state_root().as_bytes();
+
+    match s
+        .ledger
+        .append(slot, height, entry_count, poh_hash, state_root, transactions)
+    {
         Ok(record) => {
             tracing::info!(
-                "📦 Produced block at slot {} | height {} | hash {}",
+                "📦 Block slot {} | height {} | {} txs ({} ok) | {} entries | state {} | hash {}",
                 record.slot,
                 record.height,
+                tx_count,
+                succeeded,
+                entry_count,
+                &hex::encode(record.state_root)[..12],
                 &hex::encode(record.block_hash)[..16],
             );
         }
@@ -409,6 +452,7 @@ fn print_validator_info(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
     tracing::info!("│ Block Height: {:>28} │", s.block_height);
     tracing::info!("│ Leader:       {:>28} │", s.is_leader());
     tracing::info!("│ Accounts:     {:>28} │", s.accounts.account_count());
+    tracing::info!("│ Mempool:      {:>28} │", s.mempool.len());
     tracing::info!("│ PoH Hashes:   {:>28} │", s.poh.count());
     tracing::info!("│ Tower Nodes:  {:>28} │", s.tower.stats().total_nodes);
     tracing::info!("│ Ledger Blocks:{:>28} │", s.ledger.len());
@@ -578,5 +622,69 @@ mod tests {
         let a = load_identity("").unwrap();
         let b = load_identity("").unwrap();
         assert_ne!(a.verifying_key().to_bytes(), b.verifying_key().to_bytes());
+    }
+
+    #[tokio::test]
+    async fn produce_block_packs_mempool_transactions() {
+        use solana_program_executor::instruction::SystemInstruction;
+
+        let dir = std::env::temp_dir().join(format!("tn-validator-block-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let accounts = Arc::new(AccountsDB::new());
+        let mempool = Arc::new(Mempool::default_pool());
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let signer = sk.verifying_key().to_bytes();
+        let recipient = [7u8; 32];
+        accounts.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        let ix = Instruction {
+            program_id: [1u8; 32],
+            accounts: vec![
+                AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    index: 1,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            data: SystemInstruction::Transfer { lamports: 500 }.to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.account_keys.push(recipient);
+        tx.sign(&sk);
+        assert!(tx.verify_signature());
+        mempool.insert(&tx).unwrap();
+
+        let state = Arc::new(parking_lot::RwLock::new(
+            ValidatorState::new(signer, dir.to_str().unwrap(), accounts.clone(), mempool.clone())
+                .unwrap(),
+        ));
+
+        produce_block(&state).await;
+
+        assert!(mempool.is_empty(), "producer must drain the mempool");
+        let s = state.read();
+        let record = s.ledger.last().expect("a block was persisted");
+        assert_eq!(record.tx_count, 1);
+        assert_eq!(record.transactions.len(), 1);
+        assert_eq!(record.entry_count, 1);
+        assert_eq!(record.parent_hash, solana_blockstore::GENESIS_PARENT);
+
+        // The transfer and fee really moved lamports, and the committed state
+        // root matches the resulting accounts state.
+        assert_eq!(
+            accounts.load(&signer).unwrap().lamports,
+            10_000_000 - 5_000 - 500
+        );
+        assert_eq!(accounts.load(&recipient).unwrap().lamports, 500);
+        assert_eq!(record.state_root, *accounts.compute_state_root().as_bytes());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

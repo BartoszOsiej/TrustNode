@@ -612,9 +612,12 @@ name = "solana-blockstore"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "sha2",
+ "solana-accounts",
+ "solana-program-executor",
  "solana-tx-processor",
  "tracing",
 ]
@@ -656,6 +659,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-mempool"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "parking_lot",
+ "solana-accounts",
+ "solana-program-executor",
+ "solana-tx-processor",
+]
+
+[[package]]
 name = "solana-poh"
 version = "0.1.0"
 dependencies = [
@@ -694,6 +708,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solana-accounts",
+ "solana-mempool",
  "solana-poh",
  "solana-program-executor",
  "solana-tx-processor",
@@ -752,6 +767,7 @@ dependencies = [
  "solana-blockstore",
  "solana-consensus",
  "solana-gossip",
+ "solana-mempool",
  "solana-poh",
  "solana-program-executor",
  "solana-rpc",

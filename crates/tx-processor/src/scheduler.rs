@@ -148,9 +148,12 @@ impl Scheduler {
         }
     }
 
-    /// Get the next batch ready for execution
+    /// Get the next batch ready for execution, or `None` when none are queued.
     pub fn next_batch(&mut self) -> Option<ExecutionBatch> {
-        self.batches.drain(..1).next()
+        if self.batches.is_empty() {
+            return None;
+        }
+        Some(self.batches.remove(0))
     }
 
     /// Peek at the next batch without consuming it
@@ -288,6 +291,15 @@ mod tests {
         scheduler.schedule();
 
         assert_eq!(scheduler.batch_count(), 2);
+    }
+
+    #[test]
+    fn next_batch_on_empty_scheduler_is_none() {
+        let mut scheduler = Scheduler::default_solana();
+        assert!(scheduler.next_batch().is_none());
+        // An empty pending queue schedules no batches at all.
+        scheduler.schedule();
+        assert!(scheduler.next_batch().is_none());
     }
 
     #[test]

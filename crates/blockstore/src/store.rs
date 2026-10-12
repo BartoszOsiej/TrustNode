@@ -13,6 +13,7 @@
 //! - each append is `fdatasync`ed before it is acknowledged
 
 use crate::record::{BlockRecord, GENESIS_PARENT};
+use solana_tx_processor::transaction::Transaction;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -160,21 +161,32 @@ impl Blockstore {
     /// Append the next block to the ledger.
     ///
     /// Parent linkage and hashes are derived by the store, so appending in
-    /// order always produces a valid chain. Returns the persisted record.
+    /// order always produces a valid chain. `transactions` are the packed
+    /// block contents; the transaction count is derived from them. Returns
+    /// the persisted record.
     pub fn append(
         &mut self,
         slot: u64,
         height: u64,
         entry_count: u64,
-        tx_count: u64,
         poh_hash: [u8; 32],
+        state_root: [u8; 32],
+        transactions: Vec<Transaction>,
     ) -> anyhow::Result<BlockRecord> {
         let parent_hash = self
             .records
             .last()
             .map(|r| r.block_hash)
             .unwrap_or(GENESIS_PARENT);
-        let record = BlockRecord::new(parent_hash, slot, height, poh_hash, entry_count, tx_count);
+        let record = BlockRecord::new(
+            parent_hash,
+            slot,
+            height,
+            poh_hash,
+            entry_count,
+            state_root,
+            transactions,
+        );
         self.append_record(record)?;
         Ok(self.records.last().expect("just appended").clone())
     }
@@ -285,12 +297,15 @@ mod tests {
         let tmp = TempLedger::new("roundtrip");
         {
             let mut store = tmp.open();
-            let a = store.append(0, 0, 1, 0, [1; 32]).unwrap();
-            let b = store.append(1, 1, 2, 1, [2; 32]).unwrap();
-            let c = store.append(2, 2, 1, 3, [3; 32]).unwrap();
+            let a = store.append(0, 0, 1, [1; 32], [10; 32], vec![]).unwrap();
+            let b = store
+                .append(1, 1, 2, [2; 32], [11; 32], vec![])
+                .unwrap();
+            let c = store.append(2, 2, 1, [3; 32], [12; 32], vec![]).unwrap();
             assert_eq!(b.parent_hash, a.block_hash);
             assert_eq!(c.parent_hash, b.block_hash);
             assert_eq!(store.len(), 3);
+            assert_eq!(store.records()[2].state_root, [12; 32]);
         }
 
         let store = tmp.open();
@@ -301,17 +316,56 @@ mod tests {
     }
 
     #[test]
+    fn block_contents_survive_replay() {
+        use ed25519_dalek::SigningKey;
+        use solana_program_executor::instruction::SystemInstruction;
+        use solana_tx_processor::transaction::{AccountMeta, Instruction};
+
+        let tmp = TempLedger::new("contents");
+        let sk = SigningKey::from_bytes(&[1u8; 32]);
+        let signer = sk.verifying_key().to_bytes();
+
+        {
+            let mut store = tmp.open();
+            let ix = Instruction {
+                program_id: [1u8; 32],
+                accounts: vec![AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                }],
+                data: SystemInstruction::Transfer { lamports: 42 }.to_data(),
+            };
+            let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+            tx.sign(&sk);
+
+            let rec = store.append(0, 0, 1, [1; 32], [77; 32], vec![tx]).unwrap();
+            assert_eq!(rec.tx_count, 1);
+            assert_eq!(rec.transactions.len(), 1);
+        }
+
+        let store = tmp.open();
+        assert_eq!(store.len(), 1);
+        let rec = &store.records()[0];
+        assert_eq!(rec.tx_count, 1);
+        assert_eq!(rec.entry_count, 1);
+        assert_eq!(rec.state_root, [77; 32]);
+        assert!(rec.transactions[0].verify_signature());
+        assert!(rec.verify_hash());
+    }
+
+    #[test]
     fn replay_continues_chain_after_restart() {
         let tmp = TempLedger::new("restart");
         {
             let mut store = tmp.open();
-            store.append(0, 0, 1, 0, [1; 32]).unwrap();
-            store.append(1, 1, 1, 0, [2; 32]).unwrap();
+            store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
+            store.append(1, 1, 1, [2; 32], [0; 32], vec![]).unwrap();
         }
         {
             let mut store = tmp.open();
             let parent = store.last().unwrap().block_hash;
-            let next = store.append(2, 2, 1, 0, [3; 32]).unwrap();
+            let next = store.append(2, 2, 1, [3; 32], [0; 32], vec![]).unwrap();
             assert_eq!(next.parent_hash, parent);
             assert_eq!(store.len(), 3);
         }
@@ -326,9 +380,9 @@ mod tests {
     fn append_record_rejects_wrong_parent() {
         let tmp = TempLedger::new("bad-parent");
         let mut store = tmp.open();
-        store.append(0, 0, 1, 0, [1; 32]).unwrap();
+        store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
 
-        let rogue = BlockRecord::new([9; 32], 5, 5, [5; 32], 1, 0);
+        let rogue = BlockRecord::new([9; 32], 5, 5, [5; 32], 1, [0; 32], vec![]);
         let err = store.append_record(rogue).unwrap_err();
         assert!(err.to_string().contains("parent mismatch"));
         assert_eq!(store.len(), 1);
@@ -339,7 +393,7 @@ mod tests {
         let tmp = TempLedger::new("tampered");
         let mut store = tmp.open();
 
-        let mut rogue = BlockRecord::new(GENESIS_PARENT, 0, 0, [1; 32], 1, 0);
+        let mut rogue = BlockRecord::new(GENESIS_PARENT, 0, 0, [1; 32], 1, [0; 32], vec![]);
         rogue.tx_count = 99;
         let err = store.append_record(rogue).unwrap_err();
         assert!(err.to_string().contains("does not verify"));
@@ -373,7 +427,7 @@ mod tests {
         let clean;
         {
             let mut store = tmp.open();
-            store.append(0, 0, 1, 0, [1; 32]).unwrap();
+            store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
             clean = std::fs::metadata(tmp.0.join("blocks.log")).unwrap().len();
         }
         // half of a frame header
@@ -391,7 +445,7 @@ mod tests {
         let clean;
         {
             let mut store = tmp.open();
-            store.append(0, 0, 1, 0, [1; 32]).unwrap();
+            store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
             clean = std::fs::metadata(tmp.0.join("blocks.log")).unwrap().len();
         }
         raw_append(&tmp.0, b"XXXX-this-is-not-a-frame-at-all");
@@ -408,9 +462,17 @@ mod tests {
         let first;
         {
             let mut store = tmp.open();
-            first = store.append(0, 0, 1, 0, [1; 32]).unwrap();
+            first = store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
         }
-        let mut frame = wellformed_frame(&BlockRecord::new(first.block_hash, 1, 1, [2; 32], 1, 0));
+        let mut frame = wellformed_frame(&BlockRecord::new(
+            first.block_hash,
+            1,
+            1,
+            [2; 32],
+            1,
+            [0; 32],
+            vec![],
+        ));
         let n = frame.len();
         frame[n - 1] ^= 0xff; // flip a checksum byte
         raw_append(&tmp.0, &frame);
@@ -425,11 +487,11 @@ mod tests {
         let clean;
         {
             let mut store = tmp.open();
-            store.append(0, 0, 1, 0, [1; 32]).unwrap();
+            store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
             clean = std::fs::metadata(tmp.0.join("blocks.log")).unwrap().len();
         }
         // well-formed frame pointing at the wrong parent
-        let orphan = BlockRecord::new([7; 32], 1, 1, [2; 32], 1, 0);
+        let orphan = BlockRecord::new([7; 32], 1, 1, [2; 32], 1, [0; 32], vec![]);
         raw_append(&tmp.0, &wellformed_frame(&orphan));
 
         let store = tmp.open();
@@ -443,16 +505,17 @@ mod tests {
         let tmp = TempLedger::new("tamper-frame");
         {
             let mut store = tmp.open();
-            store.append(0, 0, 1, 0, [1; 32]).unwrap();
+            store.append(0, 0, 1, [1; 32], [0; 32], vec![]).unwrap();
         }
         // valid checksum, but record contents edited after hashing
         let mut rogue = BlockRecord::new(
-            BlockRecord::new(GENESIS_PARENT, 0, 0, [1; 32], 1, 0).block_hash,
+            BlockRecord::new(GENESIS_PARENT, 0, 0, [1; 32], 1, [0; 32], vec![]).block_hash,
             1,
             1,
             [2; 32],
             1,
-            0,
+            [0; 32],
+            vec![],
         );
         rogue.slot = 42; // invalidates block_hash while frame checksum stays valid
         raw_append(&tmp.0, &wellformed_frame(&rogue));

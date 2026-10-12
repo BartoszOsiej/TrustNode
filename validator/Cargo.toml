@@ -18,6 +18,7 @@ solana-gossip = { path = "../crates/gossip" }
 solana-rpc = { path = "../crates/rpc" }
 solana-program-executor = { path = "../crates/program-executor" }
 solana-blockstore = { path = "../crates/blockstore" }
+solana-mempool = { path = "../crates/mempool" }
 
 tokio = { workspace = true }
 anyhow = { workspace = true }

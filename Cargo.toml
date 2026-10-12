@@ -3,6 +3,7 @@ members = [
     "crates/poh",
     "crates/accounts",
     "crates/tx-processor",
+    "crates/mempool",
     "crates/consensus",
     "crates/turbine",
     "crates/gossip",

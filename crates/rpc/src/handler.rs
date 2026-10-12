@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solana_accounts::account::Pubkey;
 use solana_accounts::store::AccountsDB;
+use solana_mempool::Mempool;
 use solana_tx_processor::executor::Executor;
 use solana_tx_processor::transaction::Transaction;
 use std::collections::HashMap;
@@ -87,19 +88,41 @@ pub struct RpcHandler {
     executor: Executor,
     slot: parking_lot::RwLock<u64>,
     identity: Pubkey,
+    /// Optional shared mempool. When present, `sendTransaction` parks the
+    /// transaction for the block producer instead of executing it inline.
+    mempool: Option<Arc<Mempool>>,
     /// Processed transactions by base58 signature, kept for getTransaction
     transactions: parking_lot::RwLock<HashMap<String, Value>>,
 }
 
 impl RpcHandler {
-    /// Create a new RPC handler
+    /// Create a new RPC handler that executes transactions inline.
     pub fn new(accounts: Arc<AccountsDB>, identity: Pubkey) -> Self {
+        Self::build(accounts, identity, None)
+    }
+
+    /// Create an RPC handler that routes transactions into a shared mempool,
+    /// so the validator's block producer packs and executes them.
+    pub fn with_mempool(
+        accounts: Arc<AccountsDB>,
+        identity: Pubkey,
+        mempool: Arc<Mempool>,
+    ) -> Self {
+        Self::build(accounts, identity, Some(mempool))
+    }
+
+    fn build(
+        accounts: Arc<AccountsDB>,
+        identity: Pubkey,
+        mempool: Option<Arc<Mempool>>,
+    ) -> Self {
         let executor = Executor::new(accounts.clone());
         Self {
             accounts,
             executor,
             slot: parking_lot::RwLock::new(0),
             identity,
+            mempool,
             transactions: parking_lot::RwLock::new(HashMap::new()),
         }
     }
@@ -278,6 +301,30 @@ impl RpcHandler {
                 );
             }
         };
+
+        // When a mempool is wired up, park the transaction for the block
+        // producer instead of executing it here. The signature is returned
+        // immediately and the status stays `pending` until inclusion.
+        if let Some(mempool) = &self.mempool {
+            return match mempool.insert(&tx) {
+                Ok(_) => {
+                    let signature = bs58_encode(&tx.signature);
+                    let status = serde_json::json!({
+                        "slot": Value::Null,
+                        "status": "pending",
+                        "err": Value::Null,
+                        "computeUnitsConsumed": 0,
+                        "fee": tx.fee,
+                        "logs": Vec::<String>::new(),
+                    });
+                    self.transactions.write().insert(signature.clone(), status);
+                    RpcResponse::success(req.id.clone(), serde_json::json!(signature))
+                }
+                Err(e) => {
+                    RpcResponse::error(req.id.clone(), RpcError::invalid_params(&e.to_string()))
+                }
+            };
+        }
 
         // Execute against the real executor (validation, fee, instructions)
         let result = self.executor.execute_transaction(&tx);
@@ -595,5 +642,108 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["meta"]["status"], "failed");
         assert!(result["meta"]["err"].is_string());
+    }
+
+    #[test]
+    fn test_send_transaction_parks_in_mempool() {
+        use solana_tx_processor::transaction::{AccountMeta, Instruction};
+
+        let db = Arc::new(AccountsDB::new());
+        let pool = Arc::new(Mempool::default_pool());
+        let handler = RpcHandler::with_mempool(db.clone(), [0u8; 32], pool.clone());
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let signer = sk.verifying_key().to_bytes();
+        let recipient = [7u8; 32];
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        let ix = Instruction {
+            program_id: [1u8; 32],
+            accounts: vec![
+                AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    index: 1,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            data: solana_program_executor::instruction::SystemInstruction::Transfer {
+                lamports: 500,
+            }
+            .to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.account_keys.push(recipient);
+        tx.sign(&sk);
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "sendTransaction".to_string(),
+            params: Some(serde_json::json!([serde_json::to_value(&tx).unwrap()])),
+            id: Some(serde_json::json!(1)),
+        };
+        let resp = handler.handle(&req);
+        let sig = resp.result.expect("sendTransaction returns a signature");
+        assert!(sig.is_string());
+
+        // Parked, not executed: mempool holds it, balances are untouched.
+        assert_eq!(pool.len(), 1);
+        assert_eq!(db.load(&signer).unwrap().lamports, 10_000_000);
+        assert!(!db.exists(&recipient));
+
+        // Status is reported as pending until a block includes it.
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "getTransaction".to_string(),
+            params: Some(serde_json::json!([sig])),
+            id: Some(serde_json::json!(2)),
+        };
+        let resp = handler.handle(&req);
+        assert_eq!(resp.result.unwrap()["meta"]["status"], "pending");
+    }
+
+    #[test]
+    fn test_mempool_rejects_duplicate_via_rpc() {
+        use solana_tx_processor::transaction::{AccountMeta, Instruction};
+
+        let db = Arc::new(AccountsDB::new());
+        let pool = Arc::new(Mempool::default_pool());
+        let handler = RpcHandler::with_mempool(db.clone(), [0u8; 32], pool.clone());
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let signer = sk.verifying_key().to_bytes();
+        db.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+        let ix = Instruction {
+            program_id: [1u8; 32],
+            accounts: vec![AccountMeta {
+                index: 0,
+                is_signer: true,
+                is_writable: true,
+            }],
+            data: solana_program_executor::instruction::SystemInstruction::Transfer {
+                lamports: 1,
+            }
+            .to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.sign(&sk);
+        let value = serde_json::to_value(&tx).unwrap();
+
+        let mk = |id| RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "sendTransaction".to_string(),
+            params: Some(serde_json::json!([value.clone()])),
+            id: Some(serde_json::json!(id)),
+        };
+
+        assert!(handler.handle(&mk(1)).result.is_some());
+        let second = handler.handle(&mk(2));
+        assert!(second.error.is_some(), "duplicate must be rejected");
+        assert_eq!(pool.len(), 1);
     }
 }

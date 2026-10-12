@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use solana_accounts::account::Pubkey;
 
 /// A transaction in the Solana model
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transaction {
     /// Transaction signature (Ed25519)
     pub signature: Vec<u8>,
@@ -26,7 +26,7 @@ pub struct Transaction {
 }
 
 /// A single instruction within a transaction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instruction {
     /// Program to invoke
     pub program_id: Pubkey,
@@ -37,7 +37,7 @@ pub struct Instruction {
 }
 
 /// Account metadata for an instruction
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountMeta {
     /// Index of the account in the transaction's account list
     pub index: u8,
