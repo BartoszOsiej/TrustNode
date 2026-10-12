@@ -26,12 +26,18 @@ use solana_turbine::ErasureCoder;
 use solana_tx_processor::transaction::AccountMeta;
 use solana_tx_processor::{Executor, Instruction, Transaction};
 
+/// PoH hashes injected per tick.
+const HASHES_PER_TICK: u64 = 6000;
+/// Ticks per slot. The validator ticks at ~400ms, i.e. one tick is one slot.
+const TICKS_PER_SLOT: u64 = 1;
+
 /// CLI arguments
 #[derive(Parser, Debug)]
 #[command(name = "solana-validator")]
 #[command(about = "Custom Solana-like validator with PoH + Tower BFT")]
 struct Args {
-    /// Validator identity keypair (hex)
+    /// Validator identity: path to a keypair file (JSON array of 64 bytes,
+    /// Solana keygen format) or a 32-byte hex seed. Empty = generate random.
     #[arg(long, default_value = "")]
     identity: String,
 
@@ -83,6 +89,8 @@ struct ValidatorState {
     leader_schedule: LeaderSchedule,
     /// Current slot
     current_slot: u64,
+    /// PoH ticks elapsed within the current slot
+    tick_height: u64,
     /// Block height
     block_height: u64,
     /// Identity
@@ -92,8 +100,11 @@ struct ValidatorState {
 }
 
 impl ValidatorState {
-    fn new(identity: [u8; 32], ledger_dir: &str) -> anyhow::Result<Self> {
-        let accounts = Arc::new(AccountsDB::new());
+    fn new(
+        identity: [u8; 32],
+        ledger_dir: &str,
+        accounts: Arc<AccountsDB>,
+    ) -> anyhow::Result<Self> {
         let executor = Arc::new(Executor::new(accounts.clone()));
         let tower = Arc::new(Tower::new(0));
 
@@ -139,15 +150,40 @@ impl ValidatorState {
             tower,
             leader_schedule,
             current_slot,
+            tick_height: 0,
             block_height,
             identity,
             ledger,
         })
     }
 
-    /// Process a tick (PoH heartbeat)
+    /// Process a tick (PoH heartbeat) and advance the slot once the slot's
+    /// ticks are exhausted.
     fn process_tick(&mut self) {
-        self.poh.hash_n(6000); // hashes_per_tick
+        self.poh.hash_n(HASHES_PER_TICK);
+        self.tick_height += 1;
+
+        if self.tick_height >= TICKS_PER_SLOT {
+            self.tick_height = 0;
+            self.advance_slot();
+        }
+    }
+
+    /// Move to the next slot: bump the counter and re-seed the PoH clock so
+    /// the hash chain is tagged with the new slot.
+    fn advance_slot(&mut self) {
+        self.current_slot += 1;
+        self.poh.new_slot(self.current_slot);
+
+        if self.current_slot.is_multiple_of(100) {
+            tracing::info!(
+                "Slot {} | Height {} | Leader: {} | Accounts: {}",
+                self.current_slot,
+                self.block_height,
+                self.is_leader(),
+                self.accounts.account_count(),
+            );
+        }
     }
 
     /// Process a transaction
@@ -170,22 +206,9 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    // Identity: a 32-byte Ed25519 *seed* in hex. The validator's public
-    // identity is derived from it — there is no unkeyed identity.
-    let signing_key = if args.identity.is_empty() {
-        let mut seed = [0u8; 32];
-        rand::RngExt::fill(&mut rand::rng(), &mut seed);
-        ed25519_dalek::SigningKey::from_bytes(&seed)
-    } else {
-        let bytes = hex::decode(&args.identity)?;
-        let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-            anyhow::anyhow!(
-                "--identity must be a 32-byte hex seed, got {} bytes",
-                bytes.len()
-            )
-        })?;
-        ed25519_dalek::SigningKey::from_bytes(&seed)
-    };
+    // Identity comes from a Solana-style keypair file, or a raw 32-byte hex
+    // seed. There is no unkeyed identity — the public key is always derived.
+    let signing_key = load_identity(&args.identity)?;
     let identity = signing_key.verifying_key().to_bytes();
 
     tracing::info!("╔══════════════════════════════════════════════╗");
@@ -203,21 +226,24 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // A single accounts database backs the executor, the RPC API and the
+    // genesis setup — otherwise the validator and its RPC would each hold a
+    // different, half-empty world.
+    let accounts = Arc::new(AccountsDB::new());
+    create_genesis_accounts(&accounts);
+
     // Initialize state
     let state = Arc::new(parking_lot::RwLock::new(ValidatorState::new(
         identity,
         &args.ledger,
+        accounts.clone(),
     )?));
 
     // Initialize CRDS
     let _crds = Arc::new(Crds::default_store());
 
-    // Initialize RPC
-    let accounts_db = Arc::new(AccountsDB::new());
-    let rpc_handler = Arc::new(RpcHandler::new(accounts_db.clone(), identity));
-
-    // Create some test accounts
-    create_genesis_accounts(&accounts_db);
+    // Initialize RPC on the same accounts database
+    let rpc_handler = Arc::new(RpcHandler::new(accounts.clone(), identity));
 
     // Start tasks
     let mut handles = Vec::new();
@@ -234,16 +260,6 @@ async fn main() -> anyhow::Result<()> {
                 interval.tick().await;
                 let mut s = state.write();
                 s.process_tick();
-
-                if s.current_slot % 100 == 0 {
-                    tracing::info!(
-                        "Slot {} | Height {} | Leader: {} | Accounts: {}",
-                        s.current_slot,
-                        s.block_height,
-                        s.is_leader(),
-                        s.accounts.account_count(),
-                    );
-                }
             }
         }));
     }
@@ -311,12 +327,43 @@ fn create_genesis_accounts(db: &AccountsDB) {
     tracing::info!("Genesis accounts created: system, token, faucet");
 }
 
+/// Load a validator identity from a keypair file or a hex seed.
+///
+/// Accepts either a Solana-style keypair file (a JSON array of 64 bytes: a
+/// 32-byte seed followed by the 32-byte public key) or a raw 32-byte seed in
+/// hex. An empty spec generates a fresh random identity.
+fn load_identity(spec: &str) -> anyhow::Result<ed25519_dalek::SigningKey> {
+    if spec.is_empty() {
+        let mut seed = [0u8; 32];
+        rand::RngExt::fill(&mut rand::rng(), &mut seed);
+        return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
+    }
+
+    if std::path::Path::new(spec).is_file() {
+        let contents = std::fs::read_to_string(spec)
+            .map_err(|e| anyhow::anyhow!("failed to read identity file {}: {}", spec, e))?;
+        let bytes: Vec<u8> = serde_json::from_str(&contents)
+            .map_err(|e| anyhow::anyhow!("identity file {} is not a JSON byte array: {}", spec, e))?;
+        let seed: [u8; 32] = bytes
+            .get(..32)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| anyhow::anyhow!("identity file {} must hold at least 32 bytes", spec))?;
+        return Ok(ed25519_dalek::SigningKey::from_bytes(&seed));
+    }
+
+    let bytes = hex::decode(spec).map_err(|e| {
+        anyhow::anyhow!("--identity is neither a readable file nor valid hex: {}", e)
+    })?;
+    let seed: [u8; 32] = bytes
+        .get(..32)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("--identity hex must be at least 32 bytes"))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+}
+
 /// Produce a new block
 async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
     let mut s = state.write();
-
-    // Record tick
-    s.process_tick();
 
     // Get current hash
     let block_hash = s.poh.current();
@@ -339,12 +386,9 @@ async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
         }
     }
 
-    // Advance slot
-    s.current_slot += 1;
+    // The tick loop owns the slot clock; producing a block only raises the
+    // block height.
     s.block_height += 1;
-
-    // Record a tick in the PoH
-    s.process_tick();
 }
 
 /// Print validator information
@@ -489,4 +533,44 @@ async fn run_benchmarks(signing_key: &ed25519_dalek::SigningKey) {
 
     tracing::info!("");
     tracing::info!("Benchmarks complete!");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_identity_hex_seed() {
+        let loaded = load_identity(&hex::encode([7u8; 32])).unwrap();
+        let expected = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        assert_eq!(
+            loaded.verifying_key().to_bytes(),
+            expected.verifying_key().to_bytes()
+        );
+    }
+
+    #[test]
+    fn test_load_identity_keypair_file() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let mut bytes = sk.to_bytes().to_vec();
+        bytes.extend_from_slice(&sk.verifying_key().to_bytes());
+
+        let path = std::env::temp_dir().join(format!("tn-identity-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_string(&bytes).unwrap()).unwrap();
+
+        let loaded = load_identity(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            loaded.verifying_key().to_bytes(),
+            sk.verifying_key().to_bytes()
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_load_identity_empty_is_random_but_valid() {
+        let a = load_identity("").unwrap();
+        let b = load_identity("").unwrap();
+        assert_ne!(a.verifying_key().to_bytes(), b.verifying_key().to_bytes());
+    }
 }
