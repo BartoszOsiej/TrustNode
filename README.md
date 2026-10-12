@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Rust](https://img.shields.io/badge/Rust-2021-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-225_passed-00ff00?style=flat-square)](#-test-results)
+[![Tests](https://img.shields.io/badge/tests-228_passed-00ff00?style=flat-square)](#-test-results)
 [![CI](https://img.shields.io/badge/CI-clippy_-D_%7C_fmt_%7C_doc_%7C_audit-0A84FF?style=flat-square)](../../actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
@@ -80,6 +80,8 @@ no "signature exists" checks, no fake successes, no synthetic account keys:
 | **Mempool** | A bounded, fee-priority pool: signatures are verified on admission, duplicates are rejected by hash, the cheapest entry is evicted at capacity, stale entries expire, and `drain` returns highest-fee-first. |
 | **Block hash** | `block_hash` commits to the parent link, slot, height, PoH hash, entry/tx counts, the resulting state root and every packed transaction — two nodes that execute the same transactions from the same parent agree exactly. Wall-clock time is excluded. |
 | **Erasure coding** | A real systematic Reed-Solomon code over GF(256) (0x11D) — any `k` of `k+m` shards reconstruct the original bytes **exactly** or the decoder returns `None`. Tests exercise every k-subset, parity-only recovery, and reject mismatched/forged shards. |
+| **Proof of History** | An entry's hash is the result of chaining `prev_hash` forward `num_hashes` times (`PohHasher::hash_chain`) and then folding in the slot, index and payload. `PohEntry::verify` **re-executes** that whole chain, so a tampered `num_hashes`, a truncated chain, or an inflated counter all fail — the sequential work is enforced, not merely declared. |
+| **Scheduler budget** | A transaction whose own compute budget exceeds the batch cap is force-placed as a single-transaction batch (the executor then rejects it) rather than making `schedule()` spin; the batching loop also guarantees forward progress and never drops transactions. |
 
 ---
 
@@ -188,9 +190,9 @@ cargo run --release -- --bench
 ## 🧪 Test Results
 
 ```
-test result: ok. 17 passed; 0 failed   (solana-poh)
+test result: ok. 18 passed; 0 failed   (solana-poh)
 test result: ok. 19 passed; 0 failed   (solana-accounts)
-test result: ok. 22 passed; 0 failed   (solana-tx-processor)
+test result: ok. 24 passed; 0 failed   (solana-tx-processor)
 test result: ok.  9 passed; 0 failed   (solana-mempool)
 test result: ok. 25 passed; 0 failed   (solana-consensus)
 test result: ok. 31 passed; 0 failed   (solana-turbine)
@@ -201,7 +203,7 @@ test result: ok. 39 passed; 0 failed   (solana-program-executor)
 test result: ok. 19 passed; 0 failed   (solana-blockstore)
 test result: ok. 10 passed; 0 failed   (solana-validator)
 ────────────────────────────────────
-           225 passed; 0 failed
+           228 passed; 0 failed
 
 Gates: cargo fmt --check · cargo clippy --all-targets -- -D warnings
        cargo doc --no-deps (-D warnings) · cargo audit (0 findings)
@@ -323,7 +325,7 @@ cargo fmt --all
 
 ## ⚠️ Disclaimer
 
-This is an educational implementation — not a production validator. It demonstrates the core concepts of Solana's architecture over real UDP sockets, but still lacks many production features (SBF/eBPF runtime, QUIC, snapshot loading, erasure-coded ledger, etc.).
+This is a research-grade implementation built to understand Solana's architecture end to end — not an audited production validator. The crypto, PoH sequencing, scheduler, mempool, Reed-Solomon coding and UDP gossip/shred transport are all real, but it still lacks production features (SBF/eBPF runtime, QUIC, snapshot loading, erasure-coded ledger, etc.) and has not been externally audited.
 
 **Do not use this for real transactions or staking.**
 

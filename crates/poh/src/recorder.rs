@@ -7,7 +7,7 @@
 //! 4. Emitting completed entries for block production
 
 use crate::entry::{EntryData, PohEntry, TransactionEntry};
-use crate::hasher::{PohHash, PohHasher};
+use crate::hasher::PohHash;
 use crate::PohConfig;
 use anyhow::Result;
 use parking_lot::RwLock;
@@ -23,12 +23,14 @@ pub struct RecordedEntry {
 
 /// PoH Recorder — the main recording engine
 pub struct PohRecorder {
-    /// The hash chain engine
-    hasher: PohHasher,
     /// Configuration
     config: PohConfig,
+    /// Current slot
+    slot: u64,
     /// Current tick height (total ticks since genesis)
     tick_height: u64,
+    /// Total hashes performed (cumulative proof-of-history work)
+    hash_count: u64,
     /// Entries recorded in current slot
     current_entries: Vec<PohEntry>,
     /// Index within current slot
@@ -37,7 +39,7 @@ pub struct PohRecorder {
     entry_sender: mpsc::UnboundedSender<RecordedEntry>,
     /// Pending transactions to include
     pending_transactions: Vec<TransactionEntry>,
-    /// Hash of the previous entry (for chain linking)
+    /// Hash of the previous entry (the running PoH chain head)
     prev_hash: PohHash,
 }
 
@@ -49,9 +51,10 @@ impl PohRecorder {
         entry_sender: mpsc::UnboundedSender<RecordedEntry>,
     ) -> Self {
         Self {
-            hasher: PohHasher::new(genesis_hash, 0),
             config,
+            slot: 0,
             tick_height: 0,
+            hash_count: 0,
             current_entries: Vec::new(),
             entry_index: 0,
             entry_sender,
@@ -62,19 +65,12 @@ impl PohRecorder {
 
     /// Record a transaction into the PoH chain
     pub fn record_transaction(&mut self, transaction: Vec<u8>, signature: Vec<u8>) -> Result<()> {
-        // Hash forward to create space for this transaction
-        self.hasher.hash_n(1);
-
+        // A transaction entry commits one hash of sequential work.
         let prev = self.prev_hash;
-        let entry = PohEntry::transaction(
-            prev,
-            1,
-            self.hasher.slot(),
-            self.entry_index,
-            transaction,
-            signature,
-        );
+        let entry =
+            PohEntry::transaction(prev, 1, self.slot, self.entry_index, transaction, signature);
 
+        self.hash_count += 1;
         self.prev_hash = entry.hash;
         self.entry_index += 1;
         self.current_entries.push(entry.clone());
@@ -90,18 +86,19 @@ impl PohRecorder {
 
     /// Record a tick (heartbeat) into the PoH chain
     pub fn record_tick(&mut self) -> Result<()> {
-        // Hash forward hashes_per_tick times
-        self.hasher.hash_n(self.config.hashes_per_tick);
+        // A tick commits hashes_per_tick steps of sequential work; the entry
+        // hash is the chain result, so the work cannot be faked.
         self.tick_height += 1;
 
         let prev = self.prev_hash;
         let entry = PohEntry::tick(
             prev,
             self.config.hashes_per_tick,
-            self.hasher.slot(),
+            self.slot,
             self.entry_index,
         );
 
+        self.hash_count += self.config.hashes_per_tick;
         self.prev_hash = entry.hash;
         self.entry_index += 1;
         self.current_entries.push(entry.clone());
@@ -124,33 +121,19 @@ impl PohRecorder {
         let txs: Vec<TransactionEntry> = std::mem::take(&mut self.pending_transactions);
         let num_txs = txs.len() as u64;
 
-        // Hash forward
-        self.hasher.hash_n(num_txs);
-
-        // Build combined hash from all transaction hashes
-        let combined_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            for tx in &txs {
-                hasher.update(&tx.transaction);
-                hasher.update(&tx.signature);
-            }
-            let result = hasher.finalize();
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&result);
-            PohHash(bytes)
+        // One hash step of sequential work per transaction in the batch; the
+        // entry hash is the resulting chain head, so the work is committed.
+        let mut entry = PohEntry {
+            hash: PohHash::zero(),
+            prev_hash: self.prev_hash,
+            num_hashes: num_txs,
+            slot: self.slot,
+            index: self.entry_index,
+            data: EntryData::Transactions(txs),
         };
+        entry.hash = entry.compute_hash();
 
-        let prev = self.prev_hash;
-        let entry = PohEntry::with_hash(
-            combined_hash,
-            prev,
-            num_txs,
-            self.hasher.slot(),
-            self.entry_index,
-            EntryData::Transactions(txs),
-        );
-
+        self.hash_count += num_txs;
         self.prev_hash = entry.hash;
         self.entry_index += 1;
         self.current_entries.push(entry.clone());
@@ -166,14 +149,16 @@ impl PohRecorder {
     /// Start a new slot
     pub fn new_slot(&mut self, slot: u64) -> Vec<PohEntry> {
         let entries = std::mem::take(&mut self.current_entries);
-        self.hasher.new_slot(slot);
+        // The chain continues from the previous slot — that continuity is
+        // exactly what makes the history verifiable across slots.
+        self.slot = slot;
         self.entry_index = 0;
         entries
     }
 
-    /// Get current hash
+    /// Get the current chain head (the most recent entry hash)
     pub fn current_hash(&self) -> PohHash {
-        self.hasher.current()
+        self.prev_hash
     }
 
     /// Get tick height
@@ -183,12 +168,12 @@ impl PohRecorder {
 
     /// Get current slot
     pub fn slot(&self) -> u64 {
-        self.hasher.slot()
+        self.slot
     }
 
     /// Get number of hashes computed
     pub fn hash_count(&self) -> u64 {
-        self.hasher.count()
+        self.hash_count
     }
 
     /// Run the recorder loop (generates ticks at configured rate)

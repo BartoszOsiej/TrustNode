@@ -4,7 +4,7 @@
 //! Entries are chained together via PoH hashes to create an immutable,
 //! time-ordered log of all events.
 
-use crate::hasher::PohHash;
+use crate::hasher::{PohHash, PohHasher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -144,15 +144,26 @@ impl Entry {
 }
 
 impl PohEntry {
-    /// Compute the hash for this entry based on its contents.
+    /// Compute the hash for this entry.
     ///
-    /// hash = SHA256(prev_hash || slot || index || num_hashes || data_bytes)
+    /// The hash is produced the way a real PoH entry is:
+    ///
+    /// 1. Chain `prev_hash` forward `num_hashes` times. This is the sequential
+    ///    work that makes PoH a verifiable delay — there is no shortcut, the
+    ///    result can only be produced by doing every hash in order.
+    /// 2. Fold the entry's slot, index and data into the chained hash, so the
+    ///    position in the slot and the payload are committed as well.
+    ///
+    /// Because step 1 re-does the whole chain, [`PohEntry::verify`] genuinely
+    /// re-executes and enforces the sequential computation instead of merely
+    /// hashing a self-declared `num_hashes` value.
     pub fn compute_hash(&self) -> PohHash {
+        let chained = PohHasher::hash_chain(self.prev_hash, self.num_hashes);
+
         let mut hasher = Sha256::new();
-        hasher.update(self.prev_hash.0);
+        hasher.update(chained.0);
         hasher.update(self.slot.to_le_bytes());
         hasher.update(self.index.to_le_bytes());
-        hasher.update(self.num_hashes.to_le_bytes());
 
         match &self.data {
             EntryData::Tick => {
@@ -172,7 +183,10 @@ impl PohEntry {
         PohHash(bytes)
     }
 
-    /// Verify this entry's hash is correct
+    /// Verify this entry by recomputing its PoH hash.
+    ///
+    /// This re-runs the `num_hashes`-step hash chain and checks the commitment,
+    /// so a tampered `num_hashes`, `prev_hash` or payload all fail.
     pub fn verify(&self) -> bool {
         self.hash == self.compute_hash()
     }
@@ -213,25 +227,6 @@ impl PohEntry {
         };
         entry.hash = entry.compute_hash();
         entry
-    }
-
-    /// Create an entry from explicit hash (for when hash comes from PoH chain)
-    pub fn with_hash(
-        hash: PohHash,
-        prev_hash: PohHash,
-        num_hashes: u64,
-        slot: u64,
-        index: u64,
-        data: EntryData,
-    ) -> Self {
-        Self {
-            hash,
-            prev_hash,
-            num_hashes,
-            slot,
-            index,
-            data,
-        }
     }
 }
 
@@ -276,6 +271,24 @@ mod tests {
 
         entry.num_hashes = 99;
         assert!(!entry.verify());
+    }
+
+    #[test]
+    fn test_verify_enforces_sequential_work() {
+        let prev = PohHash::from_seed("prev");
+        let entry = PohEntry::tick(prev, 64, 1, 0);
+        assert!(entry.verify());
+
+        // A hash that is one sequential step short of the declared work must
+        // not verify: the whole chain has to be re-executed to be valid.
+        let mut forged = entry.clone();
+        forged.hash = PohHasher::hash_chain(prev, 63);
+        assert!(!forged.verify());
+
+        // Claiming more work than was done is likewise rejected.
+        let mut inflated = entry;
+        inflated.num_hashes = 128;
+        assert!(!inflated.verify());
     }
 
     #[test]

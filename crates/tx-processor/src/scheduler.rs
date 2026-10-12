@@ -99,17 +99,27 @@ impl Scheduler {
                 }
 
                 let tx_compute = tx.compute_budget;
+                let tx_writes = tx.write_accounts();
+                let tx_reads = tx.read_accounts();
 
-                // Check compute budget
+                // Check compute budget. A transaction whose own budget exceeds
+                // the per-batch cap can never be placed by any batch, so an
+                // empty batch force-accepts it as a single-transaction batch.
+                // The queue always drains and the executor rejects the tx,
+                // instead of the batching loop spinning forever.
                 if batch.total_compute + tx_compute > self.max_batch_compute {
-                    still_remaining.push(tx);
+                    if batch.transactions.is_empty() {
+                        batch.transactions.push(tx);
+                        batch.total_compute += tx_compute;
+                        batch_writes.extend(tx_writes);
+                        batch_reads.extend(tx_reads);
+                    } else {
+                        still_remaining.push(tx);
+                    }
                     continue;
                 }
 
                 // Check for conflicts with current batch
-                let tx_writes = tx.write_accounts();
-                let tx_reads = tx.read_accounts();
-
                 let mut conflicts = false;
 
                 for w in &tx_writes {
@@ -140,11 +150,19 @@ impl Scheduler {
 
             remaining = still_remaining;
 
-            if !batch.transactions.is_empty() {
-                self.total_scheduled += batch.transactions.len() as u64;
-                self.batches.push(batch);
-                batch_index += 1;
+            if batch.transactions.is_empty() {
+                // No transaction could be placed under the current limits
+                // (e.g. a zero max_batch_size). Stop instead of spinning and
+                // hand the unplaced transactions back to the pending queue.
+                for tx in remaining.drain(..) {
+                    self.pending.push_back(tx);
+                }
+                break;
             }
+
+            self.total_scheduled += batch.transactions.len() as u64;
+            self.batches.push(batch);
+            batch_index += 1;
         }
     }
 
@@ -314,5 +332,41 @@ mod tests {
 
         let batch = scheduler.next_batch().unwrap();
         assert_eq!(batch.transactions.len(), 2);
+    }
+
+    #[test]
+    fn over_budget_tx_is_isolated_and_schedule_terminates() {
+        // The batch cap (300k) is below the big tx's own budget (500k), so it
+        // can never share a batch. It must still be scheduled — alone — so the
+        // scheduler drains instead of looping forever.
+        let mut scheduler = Scheduler::new(10, 300_000);
+
+        let mut big = make_tx(vec![], vec![0]);
+        big.compute_budget = 500_000;
+        scheduler.enqueue(big);
+
+        let mut normal = make_tx(vec![], vec![1]);
+        normal.compute_budget = 200_000;
+        scheduler.enqueue(normal);
+
+        scheduler.schedule();
+
+        assert_eq!(scheduler.total_scheduled(), 2);
+        let first = scheduler.next_batch().unwrap();
+        assert_eq!(first.transactions.len(), 1);
+        assert_eq!(first.transactions[0].compute_budget, 500_000);
+    }
+
+    #[test]
+    fn schedule_terminates_with_zero_batch_size_and_preserves_txs() {
+        let mut scheduler = Scheduler::new(0, 1_000_000);
+        scheduler.enqueue(make_tx(vec![], vec![0]));
+        scheduler.enqueue(make_tx(vec![], vec![1]));
+
+        // Must terminate, and must not silently drop the transactions.
+        scheduler.schedule();
+
+        assert_eq!(scheduler.batch_count(), 0);
+        assert_eq!(scheduler.pending_count(), 2);
     }
 }

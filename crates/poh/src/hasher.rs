@@ -133,11 +133,18 @@ impl PohHasher {
         // Chain continues from current hash (this IS the proof of history!)
     }
 
+    /// Run a forward hash chain of exactly `steps` hashes starting from `start`.
+    ///
+    /// This is the verifiable delay itself: the result cannot be produced
+    /// without performing every intermediate hash in order.
+    pub fn hash_chain(start: PohHash, steps: u64) -> PohHash {
+        let mut hasher = PohHasher::new(start, 0);
+        hasher.hash_n(steps)
+    }
+
     /// Verify that `steps` hashes from `start_hash` leads to `end_hash`
     pub fn verify(start_hash: PohHash, steps: u64, end_hash: PohHash) -> bool {
-        let mut hasher = PohHasher::new(start_hash, 0);
-        let computed = hasher.hash_n(steps);
-        computed == end_hash
+        Self::hash_chain(start_hash, steps) == end_hash
     }
 }
 
