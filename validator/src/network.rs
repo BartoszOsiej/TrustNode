@@ -43,6 +43,7 @@ impl Network {
         gossip_port: u16,
         tpu_port: u16,
         rpc_port: u16,
+        peers: Vec<ContactInfo>,
     ) -> anyhow::Result<Self> {
         let crds = Arc::new(Crds::default_store());
 
@@ -71,6 +72,15 @@ impl Network {
         crds.set_self_info(self_contact.clone());
         crds.insert_contact(self_contact);
 
+        // Seed the CRDS with bootstrap peers so gossip has somewhere to go
+        // before any contact info has been exchanged.
+        for peer in &peers {
+            crds.insert_contact(peer.clone());
+        }
+        if !peers.is_empty() {
+            tracing::info!("Network: {} bootstrap peer(s)", peers.len());
+        }
+
         let (gossip_tx, mut gossip_rx) = mpsc::unbounded_channel::<GossipMessage>();
         let protocol = Arc::new(GossipProtocol::new(
             signing_key.clone(),
@@ -79,6 +89,23 @@ impl Network {
         ));
 
         let mut tasks = Vec::new();
+
+        // Peer liveness: ping every bootstrap peer on a fixed interval.
+        if !peers.is_empty() {
+            let protocol = protocol.clone();
+            let peers = peers.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    for peer in &peers {
+                        if let Err(e) = protocol.send_ping(peer.clone()).await {
+                            tracing::debug!("ping failed: {e}");
+                        }
+                    }
+                }
+            }));
+        }
 
         // Gossip receive: verify, dedup and handle every datagram.
         {

@@ -19,6 +19,7 @@ use solana_accounts::AccountsDB;
 use solana_blockstore::Blockstore;
 use solana_consensus::leader::{LeaderSchedule, ValidatorStake as LeaderStake};
 use solana_consensus::tower::Tower;
+use solana_gossip::message::{ContactInfo, SocketAddr as GossipAddr};
 use solana_mempool::Mempool;
 use solana_poh::{PohHash, PohHasher};
 use solana_rpc::{RpcHandler, RpcServer};
@@ -26,6 +27,7 @@ use solana_turbine::ErasureCoder;
 use solana_tx_processor::transaction::AccountMeta;
 use solana_tx_processor::{Executor, Instruction, Scheduler, Transaction};
 
+mod genesis;
 mod network;
 
 /// PoH hashes injected per tick.
@@ -76,6 +78,19 @@ struct Args {
     /// Ledger directory (persistent blockstore)
     #[arg(long, default_value = "ledger")]
     ledger: String,
+
+    /// Genesis file. When unset, a default single-validator genesis is used.
+    #[arg(long, default_value = "")]
+    genesis: String,
+
+    /// Write a default genesis file for this identity to the given path and
+    /// exit. Use it to seed a multi-validator cluster.
+    #[arg(long, default_value = "")]
+    init_genesis: String,
+
+    /// Bootstrap peer as `pubkey_hex@ip:port` (gossip address). Repeatable.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
 }
 
 /// Validator state
@@ -101,6 +116,10 @@ struct ValidatorState {
     block_height: u64,
     /// Identity
     identity: [u8; 32],
+    /// Slot of the most recently produced block, if any. Guards against
+    /// producing more than one block per slot when the producer task and the
+    /// slot clock race.
+    last_produced_slot: Option<u64>,
     /// Persistent ledger
     ledger: Blockstore,
 }
@@ -111,15 +130,19 @@ impl ValidatorState {
         ledger_dir: &str,
         accounts: Arc<AccountsDB>,
         mempool: Arc<Mempool>,
+        mut validators: Vec<LeaderStake>,
     ) -> anyhow::Result<Self> {
         let executor = Arc::new(Executor::new(accounts.clone()));
         let tower = Arc::new(Tower::new(0));
 
-        let validators = vec![LeaderStake {
-            validator: identity,
-            lamports: 10_000_000,
-            name: "self".to_string(),
-        }];
+        // Fall back to a single-validator cluster when no schedule was given.
+        if validators.is_empty() {
+            validators.push(LeaderStake {
+                validator: identity,
+                lamports: 10_000_000,
+                name: "self".to_string(),
+            });
+        }
 
         let leader_schedule = LeaderSchedule::new(validators, 4, 432_000);
 
@@ -161,6 +184,7 @@ impl ValidatorState {
             tick_height: 0,
             block_height,
             identity,
+            last_produced_slot: None,
             ledger,
         })
     }
@@ -234,12 +258,50 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Seed a fresh genesis file on request, then exit.
+    if !args.init_genesis.is_empty() {
+        let cfg = genesis::GenesisConfig::single(identity);
+        cfg.write_file(&args.init_genesis)?;
+        tracing::info!(
+            "Wrote genesis '{}' for identity {} to {}",
+            cfg.cluster,
+            hex::encode(identity),
+            args.init_genesis,
+        );
+        return Ok(());
+    }
+
+    // Load the cluster genesis (default single-validator when unset).
+    let genesis_cfg = if args.genesis.is_empty() {
+        genesis::GenesisConfig::single(identity)
+    } else {
+        genesis::GenesisConfig::from_file(&args.genesis)?
+    };
+
     // A single accounts database backs the executor, the RPC API and the
     // genesis setup — otherwise the validator and its RPC would each hold a
     // different, half-empty world. It persists under the ledger directory.
     let accounts_dir = std::path::Path::new(&args.ledger).join("accounts");
     let accounts = Arc::new(AccountsDB::open(&accounts_dir)?);
-    create_genesis_accounts(&accounts);
+    apply_genesis(&accounts, &genesis_cfg);
+
+    // Leader schedule from the genesis validator set.
+    let leader_stakes: Vec<LeaderStake> = genesis_cfg
+        .validators
+        .iter()
+        .map(|v| LeaderStake {
+            validator: v.identity,
+            lamports: v.stake,
+            name: v.name.clone(),
+        })
+        .collect();
+
+    // Bootstrap peers: `pubkey_hex@ip:port` gossip contacts.
+    let peers: Vec<ContactInfo> = args
+        .peers
+        .iter()
+        .map(|p| parse_peer(p))
+        .collect::<anyhow::Result<_>>()?;
 
     // The mempool is shared between the RPC ingress and the block producer:
     // the RPC parks transactions here, the producer drains them into blocks.
@@ -251,6 +313,7 @@ async fn main() -> anyhow::Result<()> {
         &args.ledger,
         accounts.clone(),
         mempool.clone(),
+        leader_stakes,
     )?));
 
     // Initialize RPC on the same accounts database and mempool
@@ -267,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
         args.gossip_port,
         args.tpu_port,
         args.rpc_port,
+        peers,
     )
     .await?;
 
@@ -357,26 +421,65 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create genesis accounts for testing. Idempotent: accounts that already
-/// exist (e.g. replayed from a previous run) are left untouched.
-fn create_genesis_accounts(db: &AccountsDB) {
-    let genesis = [
-        // System program
-        ([1u8; 32], 0u64),
-        // Token program
-        ([2u8; 32], 0),
-        // Faucet account (1000 SOL for testing)
-        ([3u8; 32], 1_000_000_000_000),
-    ];
-
-    for (key, lamports) in genesis {
-        if db.exists(&key) {
+/// Materialize the genesis accounts into the accounts database. Idempotent:
+/// accounts that already exist (e.g. replayed from a previous run) are left
+/// untouched, so restarting never rewrites funded balances.
+fn apply_genesis(db: &AccountsDB, cfg: &genesis::GenesisConfig) {
+    let mut created = 0u64;
+    for account in &cfg.accounts {
+        if db.exists(&account.pubkey) {
             continue;
         }
-        db.store(key, &Account::new_system_account(key, lamports));
+        db.store(
+            account.pubkey,
+            &Account::new_system_account(account.pubkey, account.lamports),
+        );
+        created += 1;
     }
 
-    tracing::info!("Genesis accounts created: system, token, faucet");
+    tracing::info!(
+        "Genesis '{}': {} account(s), {} created | {} validator(s)",
+        cfg.cluster,
+        cfg.accounts.len(),
+        created,
+        cfg.validators.len(),
+    );
+}
+
+/// Parse a bootstrap peer spec: `pubkey_hex@ip:port` (the gossip address).
+fn parse_peer(spec: &str) -> anyhow::Result<ContactInfo> {
+    let (key_hex, addr_str) = spec
+        .split_once('@')
+        .ok_or_else(|| anyhow::anyhow!("peer '{spec}' must look like <pubkey_hex>@<ip:port>"))?;
+
+    let key_bytes =
+        hex::decode(key_hex).map_err(|e| anyhow::anyhow!("peer '{spec}' has bad pubkey hex: {e}"))?;
+    let pubkey: [u8; 32] = key_bytes
+        .get(..32)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("peer '{spec}' pubkey must be 32 bytes"))?;
+
+    let addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("peer '{spec}' has bad address: {e}"))?;
+
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.octets(),
+        std::net::IpAddr::V6(_) => {
+            return Err(anyhow::anyhow!("peer '{spec}' must use an IPv4 address"));
+        }
+    };
+
+    Ok(ContactInfo {
+        pubkey,
+        gossip: GossipAddr::new(ip, addr.port()),
+        tpu: GossipAddr::new(ip, addr.port()),
+        rpc: GossipAddr::new(ip, 0),
+        tvu: GossipAddr::new(ip, addr.port()),
+        stake: 0,
+        version: "peer".to_string(),
+        wallclock: 0,
+    })
 }
 
 /// Load a validator identity from a keypair file or a hex seed.
@@ -429,6 +532,13 @@ async fn produce_block(
     let slot = s.current_slot;
     let height = s.block_height;
 
+    // At most one block per slot: the producer task and the slot clock run on
+    // independent timers, so a second invocation for a slot already produced
+    // must be a no-op rather than a duplicate block.
+    if s.last_produced_slot == Some(slot) {
+        return None;
+    }
+
     // Pack the most valuable pending work first.
     let transactions = s.mempool.drain(MAX_TXS_PER_BLOCK);
     let tx_count = transactions.len();
@@ -477,6 +587,7 @@ async fn produce_block(
     // The tick loop owns the slot clock; producing a block only raises the
     // block height.
     s.block_height += 1;
+    s.last_produced_slot = Some(slot);
 
     result
 }
@@ -703,8 +814,14 @@ mod tests {
         mempool.insert(&tx).unwrap();
 
         let state = Arc::new(parking_lot::RwLock::new(
-            ValidatorState::new(signer, dir.to_str().unwrap(), accounts.clone(), mempool.clone())
-                .unwrap(),
+            ValidatorState::new(
+                signer,
+                dir.to_str().unwrap(),
+                accounts.clone(),
+                mempool.clone(),
+                vec![],
+            )
+            .unwrap(),
         ));
 
         let produced = produce_block(&state).await.expect("a block was produced");
@@ -734,5 +851,137 @@ mod tests {
         assert_eq!(record.state_root, *accounts.compute_state_root().as_bytes());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn transfer_tx(
+        sk: &ed25519_dalek::SigningKey,
+        recipient: [u8; 32],
+        lamports: u64,
+    ) -> Transaction {
+        use solana_program_executor::instruction::SystemInstruction;
+
+        let signer = sk.verifying_key().to_bytes();
+        let ix = Instruction {
+            program_id: [1u8; 32],
+            accounts: vec![
+                AccountMeta {
+                    index: 0,
+                    is_signer: true,
+                    is_writable: true,
+                },
+                AccountMeta {
+                    index: 1,
+                    is_signer: false,
+                    is_writable: true,
+                },
+            ],
+            data: SystemInstruction::Transfer { lamports }.to_data(),
+        };
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        tx.account_keys.push(recipient);
+        tx.sign(sk);
+        assert!(tx.verify_signature());
+        tx
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tn-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Two validators booted from the same genesis and fed the same
+    /// transaction set must derive the same block: identical parent link,
+    /// state root, contents and therefore identical block hash.
+    #[tokio::test]
+    async fn two_validators_converge_on_identical_blocks() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[77u8; 32]);
+        let signer = sk.verifying_key().to_bytes();
+        let recipient = [8u8; 32];
+
+        let mut records = Vec::new();
+        for tag in ["converge-a", "converge-b"] {
+            let dir = temp_dir(tag);
+            let accounts = Arc::new(AccountsDB::new());
+            accounts.store(signer, &Account::new_system_account(signer, 10_000_000));
+
+            let mempool = Arc::new(Mempool::default_pool());
+            mempool.insert(&transfer_tx(&sk, recipient, 250)).unwrap();
+
+            let state = Arc::new(parking_lot::RwLock::new(
+                ValidatorState::new(
+                    signer,
+                    dir.to_str().unwrap(),
+                    accounts.clone(),
+                    mempool,
+                    vec![],
+                )
+                .unwrap(),
+            ));
+
+            let (_slot, block) = produce_block(&state).await.expect("block produced");
+            let record: solana_blockstore::BlockRecord =
+                serde_json::from_slice(&block).unwrap();
+            assert!(record.verify_hash());
+            records.push(record);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        assert_eq!(records[0].parent_hash, records[1].parent_hash);
+        assert_eq!(records[0].state_root, records[1].state_root);
+        assert_eq!(records[0].tx_count, records[1].tx_count);
+        assert_eq!(records[0].block_hash, records[1].block_hash);
+    }
+
+    /// The producer must not emit a second block for a slot it already
+    /// produced, even if its timer fires again before the clock advances.
+    #[tokio::test]
+    async fn produces_at_most_one_block_per_slot() {
+        let dir = temp_dir("one-per-slot");
+        let accounts = Arc::new(AccountsDB::new());
+        let mempool = Arc::new(Mempool::default_pool());
+        let signer = [5u8; 32];
+
+        let state = Arc::new(parking_lot::RwLock::new(
+            ValidatorState::new(
+                signer,
+                dir.to_str().unwrap(),
+                accounts,
+                mempool,
+                vec![],
+            )
+            .unwrap(),
+        ));
+
+        assert!(produce_block(&state).await.is_some());
+        assert!(
+            produce_block(&state).await.is_none(),
+            "second call in the same slot must be a no-op"
+        );
+
+        let s = state.read();
+        assert_eq!(s.ledger.len(), 1);
+        assert_eq!(s.block_height, 1);
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_peer_accepts_pubkey_and_address() {
+        let spec = format!("{}@127.0.0.1:8000", hex::encode([4u8; 32]));
+        let peer = parse_peer(&spec).unwrap();
+        assert_eq!(peer.pubkey, [4u8; 32]);
+        assert_eq!(peer.gossip.ip, [127, 0, 0, 1]);
+        assert_eq!(peer.gossip.port, 8000);
+        assert_eq!(peer.tpu.port, 8000);
+    }
+
+    #[test]
+    fn parse_peer_rejects_bad_specs() {
+        assert!(parse_peer("no-at-sign").is_err());
+        assert!(parse_peer("zzzz@127.0.0.1:1").is_err());
+        assert!(parse_peer(&format!("{}@not-an-addr", hex::encode([4u8; 32]))).is_err());
     }
 }
