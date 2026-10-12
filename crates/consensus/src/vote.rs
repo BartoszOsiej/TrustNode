@@ -187,6 +187,14 @@ impl VoteState {
         self.lockout_multiplier = self.lockout_multiplier.saturating_mul(2);
     }
 
+    /// Reset the lockout to its initial state. Called when a vote re-roots the
+    /// tower (builds straight on the current root) or when the root advances
+    /// past this validator's last vote, so the validator starts a fresh tower.
+    pub fn reset_lockout(&mut self) {
+        self.consecutive_votes = 0;
+        self.lockout_multiplier = 1;
+    }
+
     /// Update root (advance root after confirmation)
     pub fn update_root(&mut self, new_root: u64) {
         self.root_slot = new_root;
