@@ -8,7 +8,10 @@
 use crate::account::{Account, Pubkey};
 use crate::merkle::StateRoot;
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Position in the append-only store
@@ -20,6 +23,51 @@ pub struct AccountLocation {
     pub length: u64,
     /// Account's write version (monotonic)
     pub write_version: u64,
+}
+
+/// Log record tags.
+const RECORD_PUT: u8 = 1;
+const RECORD_DELETE: u8 = 2;
+
+/// On-disk persistence: an append-only log plus the directory holding it.
+struct Persist {
+    dir: PathBuf,
+    log: Mutex<File>,
+}
+
+impl Persist {
+    fn log_path(&self) -> PathBuf {
+        self.dir.join("accounts.log")
+    }
+
+    /// Append one already-encoded record and flush it to the OS.
+    fn append(&self, record: &[u8]) {
+        let mut log = self.log.lock();
+        if let Err(e) = log.write_all(record) {
+            tracing::error!("accounts log append failed: {}", e);
+        } else if let Err(e) = log.flush() {
+            tracing::error!("accounts log flush failed: {}", e);
+        }
+    }
+}
+
+/// Encode a stored-account record: tag, pubkey, u32 length, JSON payload.
+fn encode_put(pubkey: &Pubkey, account: &Account) -> Vec<u8> {
+    let json = serde_json::to_vec(account).unwrap_or_default();
+    let mut buf = Vec::with_capacity(1 + 32 + 4 + json.len());
+    buf.push(RECORD_PUT);
+    buf.extend_from_slice(pubkey);
+    buf.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&json);
+    buf
+}
+
+/// Encode a tombstone: tag, pubkey.
+fn encode_delete(pubkey: &Pubkey) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 32);
+    buf.push(RECORD_DELETE);
+    buf.extend_from_slice(pubkey);
+    buf
 }
 
 /// Accounts database
@@ -34,6 +82,8 @@ pub struct AccountsDB {
     account_count: RwLock<u64>,
     /// Total bytes stored
     total_bytes: RwLock<u64>,
+    /// Optional on-disk persistence
+    persist: Option<Persist>,
 }
 
 impl AccountsDB {
@@ -45,7 +95,125 @@ impl AccountsDB {
             write_version: RwLock::new(0),
             account_count: RwLock::new(0),
             total_bytes: RwLock::new(0),
+            persist: None,
         }
+    }
+
+    /// Open a persistent accounts database in `dir`, replaying an existing
+    /// append-only log so the state survives a restart.
+    pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+
+        let mut db = Self::new();
+        let log_path = dir.join("accounts.log");
+        if log_path.exists() {
+            let data = std::fs::read(&log_path)?;
+            db.replay(&data);
+            tracing::info!(
+                "accounts: replayed {} bytes from {} ({} accounts)",
+                data.len(),
+                log_path.display(),
+                db.account_count(),
+            );
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        db.persist = Some(Persist {
+            dir,
+            log: Mutex::new(file),
+        });
+        Ok(db)
+    }
+
+    /// Rebuild in-memory state by replaying an append-only log.
+    fn replay(&self, data: &[u8]) {
+        let mut cursor = 0usize;
+        while cursor < data.len() {
+            match data[cursor] {
+                RECORD_PUT => {
+                    let Some(key_end) = cursor.checked_add(1 + 32) else {
+                        break;
+                    };
+                    let Some(len_end) = key_end.checked_add(4) else {
+                        break;
+                    };
+                    if len_end > data.len() {
+                        break;
+                    }
+                    let mut pubkey = [0u8; 32];
+                    pubkey.copy_from_slice(&data[cursor + 1..key_end]);
+                    let len = u32::from_le_bytes(
+                        data[key_end..len_end].try_into().expect("4 bytes"),
+                    ) as usize;
+                    let Some(payload_end) = len_end.checked_add(len) else {
+                        break;
+                    };
+                    if payload_end > data.len() {
+                        break;
+                    }
+                    if let Ok(account) = serde_json::from_slice::<Account>(&data[len_end..payload_end])
+                    {
+                        self.store(pubkey, &account);
+                    }
+                    cursor = payload_end;
+                }
+                RECORD_DELETE => {
+                    if cursor + 1 + 32 > data.len() {
+                        break;
+                    }
+                    let mut pubkey = [0u8; 32];
+                    pubkey.copy_from_slice(&data[cursor + 1..cursor + 1 + 32]);
+                    self.remove(&pubkey);
+                    cursor += 1 + 32;
+                }
+                _ => break, // corrupt/torn tail — stop cleanly
+            }
+        }
+    }
+
+    /// Whether this database persists to disk.
+    pub fn is_persistent(&self) -> bool {
+        self.persist.is_some()
+    }
+
+    /// Flush any buffered records to the OS.
+    pub fn flush(&self) -> std::io::Result<()> {
+        if let Some(persist) = &self.persist {
+            persist.log.lock().flush()?;
+        }
+        Ok(())
+    }
+
+    /// Compact the log: rewrite only the current live accounts and atomically
+    /// replace the log, then reopen it for appending.
+    pub fn snapshot(&self) -> std::io::Result<()> {
+        let Some(persist) = &self.persist else {
+            return Ok(());
+        };
+        let tmp = persist.dir.join("accounts.log.tmp");
+
+        {
+            let mut file = File::create(&tmp)?;
+            for entry in self.index.iter() {
+                if let Some(account) = self.load(entry.key()) {
+                    file.write_all(&encode_put(entry.key(), &account))?;
+                }
+            }
+            file.flush()?;
+            file.sync_all()?;
+        }
+
+        std::fs::rename(&tmp, persist.log_path())?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(persist.log_path())?;
+        *persist.log.lock() = file;
+        Ok(())
     }
 
     /// Every pubkey currently in the index.
@@ -104,6 +272,10 @@ impl AccountsDB {
             *self.account_count.write() += 1;
         }
         *self.total_bytes.write() += length;
+
+        if let Some(persist) = &self.persist {
+            persist.append(&encode_put(&pubkey, account));
+        }
     }
 
     /// Load an account by pubkey
@@ -136,6 +308,9 @@ impl AccountsDB {
             let mut count = self.account_count.write();
             if *count > 0 {
                 *count -= 1;
+            }
+            if let Some(persist) = &self.persist {
+                persist.append(&encode_delete(pubkey));
             }
         }
         removed
@@ -288,5 +463,96 @@ mod tests {
         let stats = db.stats();
         assert_eq!(stats.account_count, 1);
         assert!(stats.total_bytes > 0);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tn-accounts-{}-{}-{}",
+            std::process::id(),
+            tag,
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_persistence_roundtrip() {
+        let dir = temp_dir("roundtrip");
+        let key = random_pubkey();
+
+        {
+            let db = AccountsDB::open(&dir).unwrap();
+            assert!(db.is_persistent());
+            db.store(key, &Account::new_system_account(key, 42_000));
+            db.flush().unwrap();
+        }
+
+        let db = AccountsDB::open(&dir).unwrap();
+        assert_eq!(db.load(&key).unwrap().lamports, 42_000);
+        assert_eq!(db.account_count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_persistence_delete_survives_restart() {
+        let dir = temp_dir("delete");
+        let key = random_pubkey();
+
+        {
+            let db = AccountsDB::open(&dir).unwrap();
+            db.store(key, &Account::new_system_account(key, 100));
+            db.remove(&key);
+            db.flush().unwrap();
+        }
+
+        let db = AccountsDB::open(&dir).unwrap();
+        assert!(!db.exists(&key));
+        assert_eq!(db.account_count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_snapshot_compacts_and_preserves_state() {
+        let dir = temp_dir("snapshot");
+        let keys: Vec<_> = (0..20).map(|_| random_pubkey()).collect();
+
+        {
+            let db = AccountsDB::open(&dir).unwrap();
+            for (i, key) in keys.iter().enumerate() {
+                // Rewrite each account several times to bloat the log.
+                for v in 0..5 {
+                    db.store(*key, &Account::new_system_account(*key, (i + v) as u64));
+                }
+            }
+            let before = std::fs::metadata(dir.join("accounts.log")).unwrap().len();
+            db.snapshot().unwrap();
+            let after = std::fs::metadata(dir.join("accounts.log")).unwrap().len();
+            assert!(
+                after < before,
+                "snapshot should shrink the log: {after} !< {before}"
+            );
+        }
+
+        let db = AccountsDB::open(&dir).unwrap();
+        assert_eq!(db.account_count(), 20);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(db.load(key).unwrap().lamports, (i + 4) as u64);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_in_memory_db_is_not_persistent() {
+        let db = AccountsDB::new();
+        assert!(!db.is_persistent());
+        assert!(db.snapshot().is_ok());
     }
 }

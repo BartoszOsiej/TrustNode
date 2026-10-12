@@ -228,8 +228,9 @@ async fn main() -> anyhow::Result<()> {
 
     // A single accounts database backs the executor, the RPC API and the
     // genesis setup — otherwise the validator and its RPC would each hold a
-    // different, half-empty world.
-    let accounts = Arc::new(AccountsDB::new());
+    // different, half-empty world. It persists under the ledger directory.
+    let accounts_dir = std::path::Path::new(&args.ledger).join("accounts");
+    let accounts = Arc::new(AccountsDB::open(&accounts_dir)?);
     create_genesis_accounts(&accounts);
 
     // Initialize state
@@ -310,19 +311,24 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create genesis accounts for testing
+/// Create genesis accounts for testing. Idempotent: accounts that already
+/// exist (e.g. replayed from a previous run) are left untouched.
 fn create_genesis_accounts(db: &AccountsDB) {
-    // System program
-    let system_program = Account::new_system_account([1u8; 32], 0);
-    db.store([1u8; 32], &system_program);
+    let genesis = [
+        // System program
+        ([1u8; 32], 0u64),
+        // Token program
+        ([2u8; 32], 0),
+        // Faucet account (1000 SOL for testing)
+        ([3u8; 32], 1_000_000_000_000),
+    ];
 
-    // Token program
-    let token_program = Account::new_system_account([2u8; 32], 0);
-    db.store([2u8; 32], &token_program);
-
-    // Faucet account (for testing)
-    let faucet = Account::new_system_account([3u8; 32], 1_000_000_000_000); // 1000 SOL
-    db.store([3u8; 32], &faucet);
+    for (key, lamports) in genesis {
+        if db.exists(&key) {
+            continue;
+        }
+        db.store(key, &Account::new_system_account(key, lamports));
+    }
 
     tracing::info!("Genesis accounts created: system, token, faucet");
 }
