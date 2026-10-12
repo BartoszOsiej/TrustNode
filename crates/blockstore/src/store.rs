@@ -298,9 +298,7 @@ mod tests {
         {
             let mut store = tmp.open();
             let a = store.append(0, 0, 1, [1; 32], [10; 32], vec![]).unwrap();
-            let b = store
-                .append(1, 1, 2, [2; 32], [11; 32], vec![])
-                .unwrap();
+            let b = store.append(1, 1, 2, [2; 32], [11; 32], vec![]).unwrap();
             let c = store.append(2, 2, 1, [3; 32], [12; 32], vec![]).unwrap();
             assert_eq!(b.parent_hash, a.block_hash);
             assert_eq!(c.parent_hash, b.block_hash);

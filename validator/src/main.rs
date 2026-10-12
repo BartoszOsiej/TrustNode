@@ -357,9 +357,8 @@ async fn main() -> anyhow::Result<()> {
                 // Prune shred history as the chain advances so stale partial
                 // blocks cannot accumulate.
                 if slot % 64 == 0 {
-                    propagator.prune_slots_below(slot.saturating_sub(
-                        network::SHRED_RETENTION_SLOTS,
-                    ));
+                    propagator
+                        .prune_slots_below(slot.saturating_sub(network::SHRED_RETENTION_SLOTS));
                 }
             }
         }));
@@ -452,8 +451,8 @@ fn parse_peer(spec: &str) -> anyhow::Result<ContactInfo> {
         .split_once('@')
         .ok_or_else(|| anyhow::anyhow!("peer '{spec}' must look like <pubkey_hex>@<ip:port>"))?;
 
-    let key_bytes =
-        hex::decode(key_hex).map_err(|e| anyhow::anyhow!("peer '{spec}' has bad pubkey hex: {e}"))?;
+    let key_bytes = hex::decode(key_hex)
+        .map_err(|e| anyhow::anyhow!("peer '{spec}' has bad pubkey hex: {e}"))?;
     let pubkey: [u8; 32] = key_bytes
         .get(..32)
         .and_then(|b| b.try_into().ok())
@@ -497,8 +496,9 @@ fn load_identity(spec: &str) -> anyhow::Result<ed25519_dalek::SigningKey> {
     if std::path::Path::new(spec).is_file() {
         let contents = std::fs::read_to_string(spec)
             .map_err(|e| anyhow::anyhow!("failed to read identity file {}: {}", spec, e))?;
-        let bytes: Vec<u8> = serde_json::from_str(&contents)
-            .map_err(|e| anyhow::anyhow!("identity file {} is not a JSON byte array: {}", spec, e))?;
+        let bytes: Vec<u8> = serde_json::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!("identity file {} is not a JSON byte array: {}", spec, e)
+        })?;
         let seed: [u8; 32] = bytes
             .get(..32)
             .and_then(|s| s.try_into().ok())
@@ -523,9 +523,7 @@ fn load_identity(spec: &str) -> anyhow::Result<ed25519_dalek::SigningKey> {
 ///
 /// On success returns `(slot, serialized_block)` so the caller can propagate
 /// it over Turbine.
-async fn produce_block(
-    state: &Arc<parking_lot::RwLock<ValidatorState>>,
-) -> Option<(u64, Vec<u8>)> {
+async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) -> Option<(u64, Vec<u8>)> {
     let mut s = state.write();
 
     let poh_hash = *s.poh.current().as_bytes();
@@ -559,10 +557,14 @@ async fn produce_block(
     // The state root commits to the effect this block had on accounts.
     let state_root = *s.accounts.compute_state_root().as_bytes();
 
-    let result = match s
-        .ledger
-        .append(slot, height, entry_count, poh_hash, state_root, transactions)
-    {
+    let result = match s.ledger.append(
+        slot,
+        height,
+        entry_count,
+        poh_hash,
+        state_root,
+        transactions,
+    ) {
         Ok(record) => {
             tracing::info!(
                 "📦 Block slot {} | height {} | {} txs ({} ok) | {} entries | state {} | hash {}",
@@ -920,8 +922,7 @@ mod tests {
             ));
 
             let (_slot, block) = produce_block(&state).await.expect("block produced");
-            let record: solana_blockstore::BlockRecord =
-                serde_json::from_slice(&block).unwrap();
+            let record: solana_blockstore::BlockRecord = serde_json::from_slice(&block).unwrap();
             assert!(record.verify_hash());
             records.push(record);
 
@@ -944,14 +945,7 @@ mod tests {
         let signer = [5u8; 32];
 
         let state = Arc::new(parking_lot::RwLock::new(
-            ValidatorState::new(
-                signer,
-                dir.to_str().unwrap(),
-                accounts,
-                mempool,
-                vec![],
-            )
-            .unwrap(),
+            ValidatorState::new(signer, dir.to_str().unwrap(), accounts, mempool, vec![]).unwrap(),
         ));
 
         assert!(produce_block(&state).await.is_some());

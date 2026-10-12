@@ -3,11 +3,11 @@
 <div align="center">
 
 [![Rust](https://img.shields.io/badge/Rust-2021-DEA584?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-151_passed-00ff00?style=flat-square)](#-test-results)
+[![Tests](https://img.shields.io/badge/tests-225_passed-00ff00?style=flat-square)](#-test-results)
 [![CI](https://img.shields.io/badge/CI-clippy_-D_%7C_fmt_%7C_doc_%7C_audit-0A84FF?style=flat-square)](../../actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 
-**A custom Solana-like validator built from scratch in Rust — PoH clock, Tower BFT consensus, Sealevel parallel execution, Turbine block propagation with Reed-Solomon erasure coding, CRDS gossip protocol, and a SBF-inspired program executor.**
+**A custom Solana-like validator built from scratch in Rust — PoH clock, Tower BFT consensus, Sealevel parallel execution, Turbine block propagation with Reed-Solomon erasure coding, CRDS gossip over real UDP, a fee-priority mempool, and a SBF-inspired program executor.**
 
 *Not a wrapper. Not a fork. Every line written from scratch to understand how Solana actually works.*
 
@@ -22,20 +22,26 @@ flowchart TB
     subgraph "Validator Node"
         POH["⏱️ PoH Clock\nSHA-256 hash chain\nVerifiable delay function"]
         TOWER["🗼 Tower BFT\nFork choice + lockout\n2/3 supermajority"]
+        POOL["🧺 Mempool\nBounded, fee-priority\nDedup + expiry"]
         TX["⚙️ Tx Processor\nSealevel scheduler\nParallel execution"]
         VM["🖥️ Program Executor\nSystem program\nToken program"]
         ACCT["💾 Accounts DB\nAppend-only store\nMerkle state root"]
-        TURB["📡 Turbine\nReed-Solomon erasure\nNeighborhood tree"]
-        GOSS["🌐 Gossip\nCRDS data store\nPush/pull protocol"]
+        TURB["📡 Turbine\nReed-Solomon erasure\nSigned shreds"]
+        GOSS["🌐 Gossip\nCRDS data store\nPush/pull/prune"]
+        NET["📶 Net\nUDP datagrams\nSigned gossip + shreds"]
         RPC["🔌 RPC Server\nJSON-RPC 2.0\nAccount queries"]
     end
 
     POH --> TOWER
+    RPC --> POOL
+    POOL --> TX
     TX --> VM
     VM --> ACCT
     TOWER --> TURB
     TX --> POH
     GOSS --> TURB
+    GOSS --- NET
+    TURB --- NET
     ACCT --> RPC
 ```
 
@@ -48,8 +54,10 @@ flowchart TB
 | **Sealevel Scheduler** | Groups non-conflicting transactions into parallel batches — read-only accounts shared, write-locked serialized | Solana Sealevel |
 | **Program Executor** | Dispatches instructions to System/Token programs — full SOL transfers, account creation, token operations | Solana SBF/EBPF |
 | **Accounts DB** | Append-only storage with DashMap index + Merkle state root — O(1) lookups, verifiable state | Solana AccountsDB |
-| **Turbine** | Reed-Solomon erasure coding splits blocks into shreds — any k-of-n shreds reconstruct the block | Solana Turbine |
-| **Gossip** | CRDS (Cluster Replicated Data Store) for node communication — push messages, pull requests, ping/pong | Solana CRDS |
+| **Mempool** | Bounded fee-priority transaction pool — dedup by signature, cheapest-entry eviction, age expiry | Solana TPU/blockstore |
+| **Turbine** | Reed-Solomon erasure coding splits blocks into shreds — any k-of-n shreds reconstruct the block, each signed by the producer | Solana Turbine |
+| **Gossip** | CRDS (Cluster Replicated Data Store) for node communication — push, pull, prune, ping/pong | Solana CRDS |
+| **Net** | UDP transport carrying signed gossip messages and Turbine shreds between validators | Solana UDP/TVU |
 | **RPC Server** | JSON-RPC 2.0 API — getAccountInfo, getBalance, getSlot, getHealth, sendTransaction | Solana JSON-RPC |
 
 ---
@@ -68,7 +76,9 @@ no "signature exists" checks, no fake successes, no synthetic account keys:
 | **Fees** | Deducted from the signer's account **before** instructions run, against the real accounts DB — insufficient balance fails with the actual `needed`/`available` lamports. The fee is paid even when an instruction later fails (Solana semantics). |
 | **Account resolution** | Instruction account indices resolve through the transaction's `account_keys`. Out-of-range indices are `AccountNotFound` — there are no synthetic fallback keys anywhere. |
 | **Signer checks** | Any account meta flagged `is_signer` must resolve to the transaction's verified signer key, or the transaction fails with `InvalidSignature`. |
-| **Identity** | `--identity` takes a 32-byte Ed25519 **seed** (hex); the validator's public identity is derived from it. Wrong-length seeds are rejected — no panics. |
+| **Identity** | `--identity` takes a 32-byte Ed25519 **seed** (hex) or a Solana-style keypair file; the validator's public identity is derived from it. Wrong-length seeds are rejected — no panics. |
+| **Mempool** | A bounded, fee-priority pool: signatures are verified on admission, duplicates are rejected by hash, the cheapest entry is evicted at capacity, stale entries expire, and `drain` returns highest-fee-first. |
+| **Block hash** | `block_hash` commits to the parent link, slot, height, PoH hash, entry/tx counts, the resulting state root and every packed transaction — two nodes that execute the same transactions from the same parent agree exactly. Wall-clock time is excluded. |
 | **Erasure coding** | A real systematic Reed-Solomon code over GF(256) (0x11D) — any `k` of `k+m` shards reconstruct the original bytes **exactly** or the decoder returns `None`. Tests exercise every k-subset, parity-only recovery, and reject mismatched/forged shards. |
 
 ---
@@ -82,13 +92,18 @@ cd TrustNode
 cargo build --release
 
 # Run validator (with block production)
-./target/release/trust-node --mining
+./target/release/solana-validator --identity $(printf '%064x' 1) --mining
 
-# Run with RPC on custom port
-./target/release/trust-node --rpc-port 9000 --gossip-port 8001
+# Run with RPC/gossip/TPU on custom ports
+./target/release/solana-validator --rpc-port 9000 --gossip-port 9001 --tpu-port 9002
+
+# Write a genesis file, then boot a second validator that bootstraps from the first
+./target/release/solana-validator --identity $(printf '%064x' 1) --init-genesis genesis.json
+./target/release/solana-validator --identity $(printf '%064x' 2) --genesis genesis.json \
+    --peer <validator-1-pubkey-hex>@127.0.0.1:9001 --mining
 
 # Run benchmarks
-./target/release/trust-node --bench
+./target/release/solana-validator --bench
 ```
 
 ---
@@ -114,6 +129,8 @@ TrustNode/
 │   │   ├── transaction.rs      # Transaction types + conflict detection
 │   │   ├── scheduler.rs        # Sealevel-like parallel batching
 │   │   └── executor.rs         # Executes scheduled batches
+│   ├── mempool/                # Pending transaction pool
+│   │   └── lib.rs              # Bounded fee-priority pool, dedup + expiry
 │   ├── consensus/              # Tower BFT
 │   │   ├── vote.rs             # Vote types + lockout tracking
 │   │   ├── tower.rs            # Vote tree + fork choice
@@ -127,7 +144,9 @@ TrustNode/
 │   ├── gossip/                 # Node communication
 │   │   ├── message.rs          # Gossip message types
 │   │   ├── crds.rs             # CRDS data store
-│   │   └── protocol.rs         # Push/pull/ping/pong protocol
+│   │   └── protocol.rs         # Push/pull/prune/ping/pong protocol
+│   ├── net/                    # UDP transport
+│   │   └── lib.rs              # Framed datagrams for gossip + shreds
 │   ├── program-executor/       # Instruction VM
 │   │   ├── instruction.rs      # System + Token instruction types
 │   │   ├── processor.rs        # Instruction dispatch engine
@@ -138,7 +157,10 @@ TrustNode/
 │       ├── handler.rs          # Request handler + methods
 │       └── server.rs           # TCP-based HTTP server
 └── validator/
-    └── src/main.rs             # Validator binary — ties everything together
+    └── src/
+        ├── main.rs             # Validator binary — ties everything together
+        ├── genesis.rs          # Cluster genesis (accounts + staked validators)
+        └── network.rs          # Gossip + TPU UDP sockets and their tasks
 ```
 
 ---
@@ -167,16 +189,19 @@ cargo run --release -- --bench
 
 ```
 test result: ok. 17 passed; 0 failed   (solana-poh)
-test result: ok. 15 passed; 0 failed   (solana-accounts)
-test result: ok. 18 passed; 0 failed   (solana-tx-processor)
-test result: ok. 21 passed; 0 failed   (solana-consensus)
-test result: ok. 23 passed; 0 failed   (solana-turbine)
-test result: ok. 14 passed; 0 failed   (solana-gossip)
-test result: ok.  9 passed; 0 failed   (solana-rpc)
-test result: ok. 20 passed; 0 failed   (solana-program-executor)
-test result: ok. 14 passed; 0 failed   (solana-blockstore)
+test result: ok. 19 passed; 0 failed   (solana-accounts)
+test result: ok. 22 passed; 0 failed   (solana-tx-processor)
+test result: ok.  9 passed; 0 failed   (solana-mempool)
+test result: ok. 25 passed; 0 failed   (solana-consensus)
+test result: ok. 31 passed; 0 failed   (solana-turbine)
+test result: ok. 17 passed; 0 failed   (solana-gossip)
+test result: ok.  6 passed; 0 failed   (solana-net)
+test result: ok. 11 passed; 0 failed   (solana-rpc)
+test result: ok. 39 passed; 0 failed   (solana-program-executor)
+test result: ok. 19 passed; 0 failed   (solana-blockstore)
+test result: ok. 10 passed; 0 failed   (solana-validator)
 ────────────────────────────────────
-           151 passed; 0 failed
+           225 passed; 0 failed
 
 Gates: cargo fmt --check · cargo clippy --all-targets -- -D warnings
        cargo doc --no-deps (-D warnings) · cargo audit (0 findings)
@@ -199,6 +224,9 @@ Options:
   --rpc-enabled            Enable JSON-RPC API [default: true]
   --bench                  Run performance benchmarks
   --ledger <DIR>           Ledger directory (persistent blockstore) [default: ledger]
+  --genesis <FILE>         Genesis file (accounts + staked validators)
+  --init-genesis <FILE>    Write a default genesis for this identity and exit
+  --peer <PUBKEY@IP:PORT>  Bootstrap gossip peer (repeatable)
 ```
 
 ---
@@ -295,7 +323,7 @@ cargo fmt --all
 
 ## ⚠️ Disclaimer
 
-This is an educational implementation — not a production validator. It demonstrates the core concepts of Solana's architecture but lacks many production features (networking, SBF runtime, snapshot loading, etc.).
+This is an educational implementation — not a production validator. It demonstrates the core concepts of Solana's architecture over real UDP sockets, but still lacks many production features (SBF/eBPF runtime, QUIC, snapshot loading, erasure-coded ledger, etc.).
 
 **Do not use this for real transactions or staking.**
 

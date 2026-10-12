@@ -207,8 +207,10 @@ mod tests {
                     is_signer: true,
                     is_writable: true,
                 }],
-                data: solana_program_executor::instruction::SystemInstruction::Transfer { lamports }
-                    .to_data(),
+                data: solana_program_executor::instruction::SystemInstruction::Transfer {
+                    lamports,
+                }
+                .to_data(),
             };
             let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
             tx.sign(&sk);

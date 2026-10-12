@@ -270,7 +270,7 @@ pub enum TokenInstruction {
     /// authority. One-time, mint must not already exist.
     InitializeMint,
     /// Create a token account holding `mint`.
-    /// Accounts: [0] = mint, [1] = new token account, [2] = owner (signer).
+    /// Accounts: `[0]` = mint, `[1]` = new token account, `[2]` = owner (signer).
     InitializeAccount { mint: Pubkey },
     /// Transfer tokens
     Transfer { amount: u64 },

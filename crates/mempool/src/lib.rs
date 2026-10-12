@@ -248,12 +248,7 @@ impl Mempool {
         Self::expire_locked(&mut inner, self.config.max_age_ms, now, &self.total_expired)
     }
 
-    fn expire_locked(
-        inner: &mut Inner,
-        max_age_ms: u64,
-        now: u64,
-        counter: &AtomicU64,
-    ) -> usize {
+    fn expire_locked(inner: &mut Inner, max_age_ms: u64, now: u64, counter: &AtomicU64) -> usize {
         let stale: Vec<u64> = inner
             .by_seq
             .iter()
@@ -284,11 +279,7 @@ impl Mempool {
     pub fn entries(&self) -> Vec<MempoolEntry> {
         let inner = self.inner.read();
         let mut entries: Vec<MempoolEntry> = inner.by_seq.values().cloned().collect();
-        entries.sort_by(|a, b| {
-            b.fee
-                .cmp(&a.fee)
-                .then(a.received_at.cmp(&b.received_at))
-        });
+        entries.sort_by(|a, b| b.fee.cmp(&a.fee).then(a.received_at.cmp(&b.received_at)));
         entries
     }
 

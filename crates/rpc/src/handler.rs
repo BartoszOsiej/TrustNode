@@ -111,11 +111,7 @@ impl RpcHandler {
         Self::build(accounts, identity, Some(mempool))
     }
 
-    fn build(
-        accounts: Arc<AccountsDB>,
-        identity: Pubkey,
-        mempool: Option<Arc<Mempool>>,
-    ) -> Self {
+    fn build(accounts: Arc<AccountsDB>, identity: Pubkey, mempool: Option<Arc<Mempool>>) -> Self {
         let executor = Executor::new(accounts.clone());
         Self {
             accounts,
@@ -725,10 +721,8 @@ mod tests {
                 is_signer: true,
                 is_writable: true,
             }],
-            data: solana_program_executor::instruction::SystemInstruction::Transfer {
-                lamports: 1,
-            }
-            .to_data(),
+            data: solana_program_executor::instruction::SystemInstruction::Transfer { lamports: 1 }
+                .to_data(),
         };
         let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
         tx.sign(&sk);

@@ -68,7 +68,8 @@ impl GenesisConfig {
 
     /// Render the genesis config as pretty JSON.
     pub fn to_json(&self) -> anyhow::Result<String> {
-        serde_json::to_string_pretty(self).map_err(|e| anyhow::anyhow!("genesis encode failed: {e}"))
+        serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow::anyhow!("genesis encode failed: {e}"))
     }
 
     /// Read a genesis config from disk.

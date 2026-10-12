@@ -121,7 +121,7 @@ fn process_initialize_mint(
 
 /// Process token account initialization.
 ///
-/// Accounts: [0] = mint, [1] = new token account, [2] = owner (signer).
+/// Accounts: `[0]` = mint, `[1]` = new token account, `[2]` = owner (signer).
 /// The mint must already exist, the new account must not, and the owner
 /// must be the transaction signer.
 fn process_initialize_account(

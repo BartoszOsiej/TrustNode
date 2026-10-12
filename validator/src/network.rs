@@ -52,11 +52,7 @@ impl Network {
         let tpu = UdpTransport::bind(&format!("0.0.0.0:{tpu_port}")).await?;
         let tpu_addr = tpu.local_addr()?;
 
-        tracing::info!(
-            "Network: gossip {} | tpu {}",
-            gossip_addr,
-            tpu_addr
-        );
+        tracing::info!("Network: gossip {} | tpu {}", gossip_addr, tpu_addr);
 
         // Advertise ourselves so peers can find us via pull requests.
         let self_contact = ContactInfo {
@@ -193,10 +189,7 @@ impl Network {
                     let Ok(dest_key) = <[u8; 32]>::try_from(dest.as_slice()) else {
                         continue;
                     };
-                    let Some(contact) = crds
-                        .contacts()
-                        .into_iter()
-                        .find(|c| c.pubkey == dest_key)
+                    let Some(contact) = crds.contacts().into_iter().find(|c| c.pubkey == dest_key)
                     else {
                         continue;
                     };

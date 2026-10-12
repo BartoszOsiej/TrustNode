@@ -139,7 +139,10 @@ impl TurbinePropagator {
         // Integrity: the stored hash must match the payload.
         if !shred.verify() {
             self.stats.write().invalid_shreds += 1;
-            tracing::warn!("Dropping shred with invalid payload hash (slot {})", shred.slot);
+            tracing::warn!(
+                "Dropping shred with invalid payload hash (slot {})",
+                shred.slot
+            );
             return false;
         }
 
@@ -147,7 +150,10 @@ impl TurbinePropagator {
         // not silently accept unsigned shreds that claim a signer.
         if !shred.signature.is_empty() && !shred.verify_signature() {
             self.stats.write().invalid_shreds += 1;
-            tracing::warn!("Dropping shred with invalid signature (slot {})", shred.slot);
+            tracing::warn!(
+                "Dropping shred with invalid signature (slot {})",
+                shred.slot
+            );
             return false;
         }
 
@@ -395,7 +401,10 @@ mod tests {
         let propagator =
             TurbinePropagator::new([1u8; 32], neighborhood, tx).with_signer(sk.clone());
 
-        propagator.propagate_block(vec![9u8; 512], 42).await.unwrap();
+        propagator
+            .propagate_block(vec![9u8; 512], 42)
+            .await
+            .unwrap();
 
         let mut seen = 0;
         while let Ok((_peer, shreds)) = rx.try_recv() {

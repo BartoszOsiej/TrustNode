@@ -146,16 +146,17 @@ impl AccountsDB {
                     }
                     let mut pubkey = [0u8; 32];
                     pubkey.copy_from_slice(&data[cursor + 1..key_end]);
-                    let len = u32::from_le_bytes(
-                        data[key_end..len_end].try_into().expect("4 bytes"),
-                    ) as usize;
+                    let len =
+                        u32::from_le_bytes(data[key_end..len_end].try_into().expect("4 bytes"))
+                            as usize;
                     let Some(payload_end) = len_end.checked_add(len) else {
                         break;
                     };
                     if payload_end > data.len() {
                         break;
                     }
-                    if let Ok(account) = serde_json::from_slice::<Account>(&data[len_end..payload_end])
+                    if let Ok(account) =
+                        serde_json::from_slice::<Account>(&data[len_end..payload_end])
                     {
                         self.store(pubkey, &account);
                     }

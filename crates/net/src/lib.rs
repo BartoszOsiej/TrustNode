@@ -51,8 +51,7 @@ impl NetMessage {
             NetMessage::Shred(_) => TAG_SHRED,
             NetMessage::Gossip(_) => TAG_GOSSIP,
         };
-        let body = serde_json::to_vec(self)
-            .map_err(|e| NetError::Encode(e.to_string()))?;
+        let body = serde_json::to_vec(self).map_err(|e| NetError::Encode(e.to_string()))?;
         let total = MAGIC.len() + 1 + body.len();
         if total > MAX_DATAGRAM {
             return Err(NetError::TooLarge(total));
@@ -75,8 +74,9 @@ impl NetMessage {
         let tag = bytes[MAGIC.len()];
         let body = &bytes[MAGIC.len() + 1..];
         match tag {
-            TAG_SHRED => serde_json::from_slice(body)
-                .map_err(|e| NetError::Malformed(format!("shred: {e}"))),
+            TAG_SHRED => {
+                serde_json::from_slice(body).map_err(|e| NetError::Malformed(format!("shred: {e}")))
+            }
             TAG_GOSSIP => serde_json::from_slice(body)
                 .map_err(|e| NetError::Malformed(format!("gossip: {e}"))),
             other => Err(NetError::Malformed(format!("unknown tag {other}"))),
