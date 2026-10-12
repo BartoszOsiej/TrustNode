@@ -125,6 +125,22 @@ impl AccountsDB {
         self.index.contains_key(pubkey)
     }
 
+    /// Remove an account from the index.
+    ///
+    /// The append-only buffer is never rewritten (old bytes stay until
+    /// compaction), so this is an index-only operation. It exists so that a
+    /// failed transaction can roll back an account it created.
+    pub fn remove(&self, pubkey: &Pubkey) -> bool {
+        let removed = self.index.remove(pubkey).is_some();
+        if removed {
+            let mut count = self.account_count.write();
+            if *count > 0 {
+                *count -= 1;
+            }
+        }
+        removed
+    }
+
     /// Get account count
     pub fn account_count(&self) -> u64 {
         *self.account_count.read()

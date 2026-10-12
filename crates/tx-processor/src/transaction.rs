@@ -101,28 +101,38 @@ impl Transaction {
         self.signature = key.sign(&self.hash()).to_bytes().to_vec();
     }
 
-    /// Get all accounts this transaction reads
-    pub fn read_accounts(&self) -> Vec<u8> {
+    /// Resolve an account index to the pubkey it refers to.
+    ///
+    /// Indexes past the end of `account_keys` do not panic — they resolve to
+    /// `None`. Schedule-time conflicts are decided on the 32-byte pubkey, not
+    /// on the positional index, so two transactions that reference the same
+    /// account through different indexes still conflict.
+    pub fn resolve(&self, index: u8) -> Option<Pubkey> {
+        self.account_keys.get(index as usize).copied()
+    }
+
+    /// Get all accounts this transaction reads (as resolved pubkeys)
+    pub fn read_accounts(&self) -> Vec<Pubkey> {
         self.instructions
             .iter()
             .flat_map(|ix| {
                 ix.accounts
                     .iter()
                     .filter(|a| !a.is_writable)
-                    .map(|a| a.index)
+                    .filter_map(|a| self.resolve(a.index))
             })
             .collect()
     }
 
-    /// Get all accounts this transaction writes
-    pub fn write_accounts(&self) -> Vec<u8> {
+    /// Get all accounts this transaction writes (as resolved pubkeys)
+    pub fn write_accounts(&self) -> Vec<Pubkey> {
         self.instructions
             .iter()
             .flat_map(|ix| {
                 ix.accounts
                     .iter()
                     .filter(|a| a.is_writable)
-                    .map(|a| a.index)
+                    .filter_map(|a| self.resolve(a.index))
             })
             .collect()
     }
@@ -370,11 +380,67 @@ mod tests {
             data: vec![],
         };
 
-        let tx1 = Transaction::new(signer, vec![ix1], [0u8; 32]);
-        let tx2 = Transaction::new(signer, vec![ix2], [0u8; 32]);
+        let mut tx1 = Transaction::new(signer, vec![ix1], [0u8; 32]);
+        let mut tx2 = Transaction::new(signer, vec![ix2], [0u8; 32]);
+        // Both txs need a slot for the account at index 1.
+        tx1.account_keys.push([8u8; 32]);
+        tx2.account_keys.push([9u8; 32]);
 
-        // Different accounts — no conflict
+        // Different resolved pubkeys — no conflict
         assert!(!tx1.conflicts_with(&tx2));
+    }
+
+    #[test]
+    fn test_conflict_on_shared_pubkey_across_indexes() {
+        let signer = test_signer();
+        let program = test_program();
+
+        // tx1 writes account_keys[1], tx2 writes account_keys[2] — different
+        // positional indexes, but both slots hold the same pubkey.
+        let ix1 = Instruction {
+            program_id: program,
+            accounts: vec![AccountMeta {
+                index: 1,
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![],
+        };
+        let ix2 = Instruction {
+            program_id: program,
+            accounts: vec![AccountMeta {
+                index: 2,
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![],
+        };
+
+        let mut tx1 = Transaction::new(signer, vec![ix1], [0u8; 32]);
+        let mut tx2 = Transaction::new(signer, vec![ix2], [0u8; 32]);
+        tx1.account_keys.push([5u8; 32]);
+        tx2.account_keys.push([6u8; 32]);
+        tx2.account_keys.push([5u8; 32]);
+
+        // Same pubkey, different index — still a conflict.
+        assert!(tx1.conflicts_with(&tx2));
+    }
+
+    #[test]
+    fn test_out_of_range_index_is_ignored() {
+        let signer = test_signer();
+        let ix = Instruction {
+            program_id: test_program(),
+            accounts: vec![AccountMeta {
+                index: 200, // never a valid slot
+                is_signer: false,
+                is_writable: true,
+            }],
+            data: vec![],
+        };
+        let tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        assert!(tx.write_accounts().is_empty());
+        assert!(tx.read_accounts().is_empty());
     }
 
     #[test]

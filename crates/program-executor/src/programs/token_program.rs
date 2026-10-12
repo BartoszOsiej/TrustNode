@@ -145,7 +145,7 @@ fn process_initialize_account(
     let new_key = resolve_account_key(account_metas[1].index, account_keys)?;
     let owner_key = resolve_account_key(account_metas[2].index, account_keys)?;
 
-    if &mint_key != &mint {
+    if mint_key != mint {
         return Err(InstructionError::MintMismatch);
     }
 

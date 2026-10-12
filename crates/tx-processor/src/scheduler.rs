@@ -5,6 +5,7 @@
 //! Sealevel — maximizing throughput by finding parallelism in tx ordering.
 
 use crate::transaction::Transaction;
+use solana_accounts::account::Pubkey;
 use std::collections::VecDeque;
 
 /// A batch of transactions that can execute in parallel
@@ -82,9 +83,12 @@ impl Scheduler {
                 total_compute: 0,
             };
 
-            // Track which accounts are used in this batch
-            let mut batch_writes: Vec<u8> = Vec::new();
-            let mut batch_reads: Vec<u8> = Vec::new();
+            // Track which accounts are used in this batch. Keys are the
+            // resolved 32-byte pubkeys (not positional indexes), so the
+            // conflict set is stable regardless of how each transaction
+            // happens to order its account list.
+            let mut batch_writes: Vec<Pubkey> = Vec::new();
+            let mut batch_reads: Vec<Pubkey> = Vec::new();
 
             let mut still_remaining: Vec<Transaction> = Vec::new();
 
@@ -206,6 +210,13 @@ mod tests {
         let program = [1u8; 32];
         let signer = [2u8; 32];
 
+        let max_index = read_accounts
+            .iter()
+            .chain(write_accounts.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+
         let mut accounts = Vec::new();
         for i in read_accounts {
             accounts.push(AccountMeta {
@@ -228,7 +239,11 @@ mod tests {
             data: vec![],
         };
 
-        Transaction::new(signer, vec![ix], [0u8; 32])
+        let mut tx = Transaction::new(signer, vec![ix], [0u8; 32]);
+        // Give every referenced index a distinct pubkey so conflicts are
+        // decided on real account identity, not on the array position.
+        tx.account_keys = (0..=max_index).map(|i| [i.wrapping_add(10); 32]).collect();
+        tx
     }
 
     #[test]
