@@ -7,6 +7,7 @@ members = [
     "crates/consensus",
     "crates/turbine",
     "crates/gossip",
+    "crates/net",
     "crates/rpc",
     "crates/program-executor",
     "crates/blockstore",

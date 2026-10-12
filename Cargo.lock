@@ -670,6 +670,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "solana-net"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "solana-gossip",
+ "solana-turbine",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "solana-poh"
 version = "0.1.0"
 dependencies = [
@@ -723,6 +736,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "dashmap",
+ "ed25519-dalek",
  "hex",
  "parking_lot",
  "rand",
@@ -768,6 +782,7 @@ dependencies = [
  "solana-consensus",
  "solana-gossip",
  "solana-mempool",
+ "solana-net",
  "solana-poh",
  "solana-program-executor",
  "solana-rpc",

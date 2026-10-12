@@ -19,13 +19,14 @@ use solana_accounts::AccountsDB;
 use solana_blockstore::Blockstore;
 use solana_consensus::leader::{LeaderSchedule, ValidatorStake as LeaderStake};
 use solana_consensus::tower::Tower;
-use solana_gossip::Crds;
 use solana_mempool::Mempool;
 use solana_poh::{PohHash, PohHasher};
 use solana_rpc::{RpcHandler, RpcServer};
 use solana_turbine::ErasureCoder;
 use solana_tx_processor::transaction::AccountMeta;
 use solana_tx_processor::{Executor, Instruction, Scheduler, Transaction};
+
+mod network;
 
 /// PoH hashes injected per tick.
 const HASHES_PER_TICK: u64 = 6000;
@@ -252,9 +253,6 @@ async fn main() -> anyhow::Result<()> {
         mempool.clone(),
     )?));
 
-    // Initialize CRDS
-    let _crds = Arc::new(Crds::default_store());
-
     // Initialize RPC on the same accounts database and mempool
     let rpc_handler = Arc::new(RpcHandler::with_mempool(
         accounts.clone(),
@@ -262,12 +260,23 @@ async fn main() -> anyhow::Result<()> {
         mempool.clone(),
     ));
 
+    // Bind the gossip and TPU sockets and start their runtime tasks.
+    let network = network::Network::start(
+        identity,
+        signing_key.clone(),
+        args.gossip_port,
+        args.tpu_port,
+        args.rpc_port,
+    )
+    .await?;
+
     // Start tasks
-    let mut handles = Vec::new();
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     // PoH loop
     {
         let state = state.clone();
+        let propagator = network.propagator.clone();
         handles.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(
                 std::time::Duration::from_millis(400), // ~400ms slot time
@@ -275,8 +284,19 @@ async fn main() -> anyhow::Result<()> {
 
             loop {
                 interval.tick().await;
-                let mut s = state.write();
-                s.process_tick();
+                let slot = {
+                    let mut s = state.write();
+                    s.process_tick();
+                    s.current_slot
+                };
+
+                // Prune shred history as the chain advances so stale partial
+                // blocks cannot accumulate.
+                if slot % 64 == 0 {
+                    propagator.prune_slots_below(slot.saturating_sub(
+                        network::SHRED_RETENTION_SLOTS,
+                    ));
+                }
             }
         }));
     }
@@ -298,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
     // Block production loop (if mining)
     if args.mining {
         let state = state.clone();
+        let propagator = network.propagator.clone();
         handles.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));
 
@@ -310,7 +331,13 @@ async fn main() -> anyhow::Result<()> {
                     s.is_leader()
                 };
                 if should_produce {
-                    produce_block(&state).await;
+                    if let Some((slot, block)) = produce_block(&state).await {
+                        // Propagate the block to peers as erasure-coded,
+                        // signed shreds over the TPU socket.
+                        if let Err(e) = propagator.propagate_block(block, slot).await {
+                            tracing::warn!("block propagation failed at slot {slot}: {e}");
+                        }
+                    }
                 }
             }
         }));
@@ -318,6 +345,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Print startup info
     print_validator_info(&state);
+
+    // Keep the network tasks alive alongside the loops.
+    handles.extend(network.tasks);
 
     // Wait for all tasks
     for handle in handles {
@@ -387,7 +417,12 @@ fn load_identity(spec: &str) -> anyhow::Result<ed25519_dalek::SigningKey> {
 /// schedule them into non-conflicting Sealevel batches, execute those batches,
 /// commit the resulting accounts state root, and persist the block along with
 /// its transactions.
-async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
+///
+/// On success returns `(slot, serialized_block)` so the caller can propagate
+/// it over Turbine.
+async fn produce_block(
+    state: &Arc<parking_lot::RwLock<ValidatorState>>,
+) -> Option<(u64, Vec<u8>)> {
     let mut s = state.write();
 
     let poh_hash = *s.poh.current().as_bytes();
@@ -414,7 +449,7 @@ async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
     // The state root commits to the effect this block had on accounts.
     let state_root = *s.accounts.compute_state_root().as_bytes();
 
-    match s
+    let result = match s
         .ledger
         .append(slot, height, entry_count, poh_hash, state_root, transactions)
     {
@@ -429,15 +464,21 @@ async fn produce_block(state: &Arc<parking_lot::RwLock<ValidatorState>>) {
                 &hex::encode(record.state_root)[..12],
                 &hex::encode(record.block_hash)[..16],
             );
+            serde_json::to_vec(&record)
+                .ok()
+                .map(|bytes| (record.slot, bytes))
         }
         Err(err) => {
             tracing::error!("Ledger append failed at slot {}: {}", slot, err);
+            None
         }
-    }
+    };
 
     // The tick loop owns the slot clock; producing a block only raises the
     // block height.
     s.block_height += 1;
+
+    result
 }
 
 /// Print validator information
@@ -666,7 +707,14 @@ mod tests {
                 .unwrap(),
         ));
 
-        produce_block(&state).await;
+        let produced = produce_block(&state).await.expect("a block was produced");
+
+        // The produced payload is the serialized block, ready to propagate.
+        let (produced_slot, block_bytes) = produced;
+        let decoded: solana_blockstore::BlockRecord =
+            serde_json::from_slice(&block_bytes).expect("block payload decodes");
+        assert_eq!(decoded.slot, produced_slot);
+        assert!(decoded.verify_hash());
 
         assert!(mempool.is_empty(), "producer must drain the mempool");
         let s = state.read();

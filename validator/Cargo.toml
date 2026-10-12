@@ -15,6 +15,7 @@ solana-tx-processor = { path = "../crates/tx-processor" }
 solana-consensus = { path = "../crates/consensus" }
 solana-turbine = { path = "../crates/turbine" }
 solana-gossip = { path = "../crates/gossip" }
+solana-net = { path = "../crates/net" }
 solana-rpc = { path = "../crates/rpc" }
 solana-program-executor = { path = "../crates/program-executor" }
 solana-blockstore = { path = "../crates/blockstore" }

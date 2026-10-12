@@ -6,6 +6,7 @@ description = "Turbine block propagation — Reed-Solomon erasure coding"
 
 [dependencies]
 solana-poh = { path = "../poh" }
+ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 parking_lot = { workspace = true }

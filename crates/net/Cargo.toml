@@ -1,0 +1,16 @@
+[package]
+name = "solana-net"
+version = "0.1.0"
+edition = "2021"
+description = "UDP transport — gossip messages and turbine shreds on the wire"
+
+[dependencies]
+solana-gossip = { path = "../gossip" }
+solana-turbine = { path = "../turbine" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
