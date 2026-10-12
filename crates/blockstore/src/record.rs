@@ -26,16 +26,23 @@ pub struct BlockRecord {
     pub entry_count: u64,
     /// Number of transactions executed in the block
     pub tx_count: u64,
-    /// Production time, Unix milliseconds
+    /// Production time, Unix milliseconds.
+    ///
+    /// This is **metadata only** — it is deliberately excluded from
+    /// [`BlockRecord::compute_hash`]. Wall-clock time is not deterministic
+    /// across nodes, so folding it into the block hash would make honest
+    /// validators disagree on the hash of an identical block.
     pub timestamp_ms: u64,
 }
 
 impl BlockRecord {
     /// Build a record for a child of `parent_hash`.
     ///
-    /// The `block_hash` is computed from every field, so two records with
-    /// identical contents (same timestamp granularity) are interchangeable
-    /// only if they describe the exact same block.
+    /// The `block_hash` is a deterministic function of the consensus
+    /// contents — parent hash, slot, height, PoH hash and entry/transaction
+    /// counts. The wall-clock `timestamp_ms` is recorded as metadata but is
+    /// not part of the hash, so two nodes producing the same block agree on
+    /// the same `block_hash` regardless of when they ran.
     pub fn new(
         parent_hash: [u8; 32],
         slot: u64,
@@ -56,7 +63,6 @@ impl BlockRecord {
             &poh_hash,
             entry_count,
             tx_count,
-            timestamp_ms,
         );
 
         Self {
@@ -71,7 +77,10 @@ impl BlockRecord {
         }
     }
 
-    /// Deterministic block hash over all record contents.
+    /// Deterministic, consensus-critical block hash.
+    ///
+    /// Commits to every field that two honest nodes must agree on. It
+    /// intentionally excludes `timestamp_ms` — see [`BlockRecord::timestamp_ms`].
     pub fn compute_hash(
         parent_hash: &[u8; 32],
         slot: u64,
@@ -79,7 +88,6 @@ impl BlockRecord {
         poh_hash: &[u8; 32],
         entry_count: u64,
         tx_count: u64,
-        timestamp_ms: u64,
     ) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
@@ -90,11 +98,12 @@ impl BlockRecord {
         hasher.update(poh_hash);
         hasher.update(entry_count.to_le_bytes());
         hasher.update(tx_count.to_le_bytes());
-        hasher.update(timestamp_ms.to_le_bytes());
         hasher.finalize().into()
     }
 
-    /// Check that `block_hash` matches the record contents.
+    /// Check that `block_hash` matches the record's consensus contents.
+    ///
+    /// `timestamp_ms` is metadata and is not covered by the hash.
     pub fn verify_hash(&self) -> bool {
         self.block_hash
             == Self::compute_hash(
@@ -104,7 +113,6 @@ impl BlockRecord {
                 &self.poh_hash,
                 self.entry_count,
                 self.tx_count,
-                self.timestamp_ms,
             )
     }
 }
@@ -115,16 +123,33 @@ mod tests {
 
     #[test]
     fn hash_is_deterministic() {
-        let a = BlockRecord::compute_hash(&[1; 32], 5, 4, &[2; 32], 10, 3, 1_700_000_000_000);
-        let b = BlockRecord::compute_hash(&[1; 32], 5, 4, &[2; 32], 10, 3, 1_700_000_000_000);
+        let a = BlockRecord::compute_hash(&[1; 32], 5, 4, &[2; 32], 10, 3);
+        let b = BlockRecord::compute_hash(&[1; 32], 5, 4, &[2; 32], 10, 3);
         assert_eq!(a, b);
     }
 
     #[test]
     fn hash_changes_with_slot() {
-        let a = BlockRecord::compute_hash(&[1; 32], 5, 4, &[2; 32], 10, 3, 1);
-        let b = BlockRecord::compute_hash(&[1; 32], 6, 4, &[2; 32], 10, 3, 1);
+        let a = BlockRecord::compute_hash(&[1; 32], 5, 4, &[2; 32], 10, 3);
+        let b = BlockRecord::compute_hash(&[1; 32], 6, 4, &[2; 32], 10, 3);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hash_ignores_timestamp() {
+        // Same consensus contents, different wall-clock production time:
+        // the block hash must be identical on both nodes.
+        let mut a = BlockRecord::new(GENESIS_PARENT, 0, 0, [7; 32], 1, 0);
+        let mut b = a.clone();
+        a.timestamp_ms = 1_000;
+        b.timestamp_ms = 9_999_999;
+        assert_eq!(a.block_hash, b.block_hash);
+        assert_eq!(
+            BlockRecord::compute_hash(&a.parent_hash, a.slot, a.height, &a.poh_hash, a.entry_count, a.tx_count),
+            a.block_hash
+        );
+        assert!(a.verify_hash());
+        assert!(b.verify_hash());
     }
 
     #[test]
@@ -140,5 +165,14 @@ mod tests {
         let mut rec = BlockRecord::new(GENESIS_PARENT, 0, 0, [7; 32], 1, 0);
         rec.slot = 1;
         assert!(!rec.verify_hash());
+    }
+
+    #[test]
+    fn tampered_timestamp_still_verifies() {
+        // timestamp_ms is metadata, not consensus — changing it must not
+        // break the hash chain.
+        let mut rec = BlockRecord::new(GENESIS_PARENT, 0, 0, [7; 32], 1, 0);
+        rec.timestamp_ms = 42;
+        assert!(rec.verify_hash());
     }
 }
