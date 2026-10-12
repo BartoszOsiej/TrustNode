@@ -1,3 +1,15 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/BartoszOsiej/BartoszOsiej/stats/svg/banner-dark.svg" />
+  <img alt="Bartosz Osiej — systems developer, Hartwell Labs" src="https://raw.githubusercontent.com/BartoszOsiej/BartoszOsiej/stats/svg/banner-light.svg" width="100%" />
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/BartoszOsiej/BartoszOsiej/stats/svg/rule-dark.svg" />
+  <img alt="" src="https://raw.githubusercontent.com/BartoszOsiej/BartoszOsiej/stats/svg/rule-light.svg" width="100%" />
+</picture>
+
+<!-- self-hosted animated header: https://github.com/BartoszOsiej/BartoszOsiej -->
+
 <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=130&section=header&text=TrustNode&fontSize=36&animation=fadeIn" width="100%" />
 
 <div align="center">
